@@ -1,0 +1,55 @@
+{
+  "name": "herdr-envoy",
+  "version": "0.1.0",
+  "description": "opencode plugin: dispatch bounded tasks to real peer opencode agents (envoys) running in their own git worktrees, spawned as split panes in herdr. Disk is the transport, file-watches are the events. The coordinator auto-verifies and optionally auto-merges. Ships the delegation tooling, an /envoy command, and a self-provisioned skill — your agents stay yours.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "delegation",
+    "orchestration",
+    "envoy",
+    "git-worktree",
+    "herdr"
+  ],
+  "license": "MIT",
+  "author": "Quintin De Kok",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SynthSwarm/herdr-envoy.git"
+  },
+  "homepage": "https://github.com/SynthSwarm/herdr-envoy#readme",
+  "bugs": {
+    "url": "https://github.com/SynthSwarm/herdr-envoy/issues"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.4",
+    "@types/node": "^26.1.1",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
