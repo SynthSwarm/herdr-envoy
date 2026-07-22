@@ -61,14 +61,14 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
         cfg.command[DELEGATE_COMMAND_NAME] = delegateCommand;
       }
     },
-    // Drain the async event queue at safe points (between turns). Never blocks
-    // the user's current turn; surfaces completions as they arrive (spec §13).
+    // Learn (and keep fresh) the coordinator's own session id so the plugin can
+    // prompt ITSELF the moment a delegate reports (client.session.promptAsync,
+    // the discordance-proven inbound path). The watcher/timers notify directly —
+    // there is NO queue and NO idle-gated draining; a delegate result wakes the
+    // coordinator immediately, whether it is idle or mid-turn.
     async event({ event }) {
       if (event.type === "session.idle") {
         coord.setSessionId(event.properties.sessionID);
-        for (const ev of coord.drain()) {
-          await coord.surface(ev);
-        }
       }
     },
     async dispose() {

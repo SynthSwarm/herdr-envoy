@@ -23,23 +23,17 @@ import {
   type Handoff,
   type Result,
 } from "./protocol.js";
-import { verify, synthMerge } from "./verify.js";
 
-export interface QueuedEvent {
-  kind: "result" | "block" | "startup-timeout" | "stalled";
-  jobId: string;
-  at: number;
-  payload?: unknown;
-}
-
-// One coordinator per opencode process. Holds the async event queue + watchers.
+// One coordinator per opencode process. Watches job-dirs and notifies the
+// coordinator agent DIRECTLY (client.session.promptAsync into its own session,
+// exactly like discordance's inbound path) the moment a delegate reports —
+// no internal queue, no idle-gating. The agent then drives verify/merge/reap.
 export class Coordinator {
-  private queue: QueuedEvent[] = [];
   private watchers = new Map<string, FSWatcher>();
   private jobs = new Map<string, { agent: string; pane?: string; worktree: string; branch: string; repo: string; consumed?: Consumed; reaped?: boolean }>();
-  // The coordinator's own opencode session id, learned from session.idle events.
-  // Used to enqueue completion/block notes into opencode's native prompt QUEUE
-  // (session.promptAsync) instead of force-injecting into the TUI text box.
+  // The coordinator's own opencode session id, learned from session events. Used
+  // to prompt ITSELF via session.promptAsync so a delegate report immediately
+  // wakes the coordinator agent to react (works whether idle or mid-turn).
   private sessionId: string | null = null;
 
   constructor(private $: Shell, private client: Client) {}
@@ -48,135 +42,138 @@ export class Coordinator {
     this.sessionId = id;
   }
 
-  enqueue(ev: QueuedEvent) {
-    this.queue.push(ev);
-  }
-
-  // Drained by the plugin at safe points (between turns). Non-blocking; returns
-  // and clears whatever has accumulated.
-  drain(): QueuedEvent[] {
-    const out = this.queue;
-    this.queue = [];
-    return out;
-  }
-
-  pending(): number {
-    return this.queue.length;
-  }
-
-  // Surface a drained event to the coordinator non-blockingly. For results,
-  // auto-verify (§5/§6) and — under auto-after-checks — synthetic-merge (§7)
-  // before surfacing, so the coordinator agent gets an already-adjudicated note.
-  async surface(ev: QueuedEvent): Promise<void> {
-    const short = ev.jobId.slice(0, 8);
-    let toast = "";
-    let note = "";
-    if (ev.kind === "result") {
-      const r = ev.payload as Result;
-      const job = this.jobs.get(ev.jobId);
-      const consumed = await this.loadConsumed(ev.jobId);
-
-      let adjudication = "";
-      let verifyOk = true;
-      let merged = false;
-      if (consumed) {
-        const v = await verify(this.$, r, consumed, job?.worktree);
-        if (!v.ok) {
-          verifyOk = false;
-          adjudication = ` VERIFY FAILED: ${v.reason}. Do not merge.`;
-        } else if (r.outputContract === "code-change" && r.status === "success") {
-          adjudication = ` verified (${v.commits} commit(s)).`;
-          const policy = consumed.mergePolicy;
-          const target = consumed.targetBranch;
-          if (policy === "auto-after-checks" && job && target) {
-            const m = await synthMerge(this.$, job.repo, r.branch!, target, consumed.checks ?? []);
-            if (m.ok) {
-              merged = true;
-              adjudication += ` MERGED into ${target} @ ${m.mergeCommit!.slice(0, 8)} (checks passed).`;
-            } else {
-              adjudication += ` MERGE HELD: ${m.reason}.`;
-            }
-          } else {
-            adjudication += ` mergePolicy=${policy}; awaiting your authorization to merge into ${target}.`;
-          }
-        } else {
-          adjudication = ` (${r.outputContract}, trusted).`;
-        }
+  // Resolve the session to prompt: prefer the learned id; else fall back to the
+  // most-recently-updated session on this server (best-effort).
+  private async resolveSessionId(): Promise<string | null> {
+    if (this.sessionId) return this.sessionId;
+    try {
+      const res: any = await (this.client as any).session.list();
+      const arr = res?.data ?? res;
+      if (Array.isArray(arr) && arr.length) {
+        const sorted = [...arr].sort((a, b) => (b?.time?.updated ?? 0) - (a?.time?.updated ?? 0));
+        this.sessionId = sorted[0]?.id ?? null;
+        return this.sessionId;
       }
+    } catch {
+      /* best-effort */
+    }
+    return null;
+  }
 
-      toast = `delegate ${short}: ${r.status}`;
-      note =
-        `[peer-delegate] job ${short} completed (${r.status}, ${r.outputContract}).` +
-        adjudication +
-        ` Summary: ${r.summary}`;
-      // acknowledge: delete result.json (§6 — chat note is the retained record).
+  // Prompt the coordinator agent itself. Enqueues natively via promptAsync so it
+  // runs whether the coordinator is idle or busy (the discordance-proven path).
+  private async promptSelf(text: string): Promise<void> {
+    const id = await this.resolveSessionId();
+    if (!id) return;
+    try {
+      await (this.client as any).session.promptAsync({
+        path: { id },
+        body: { parts: [{ type: "text", text }] },
+      });
+    } catch {
+      // Last-ditch fallback: park it in the TUI prompt box.
       try {
-        await fs.unlink(path.join(jobDir(ev.jobId), FILES.result));
+        await (this.client as any).tui.appendPrompt({ body: { text } });
       } catch {
         /* best-effort */
       }
-
-      // Auto-reap: clean up pane + worktree + orphan workspace + job-dir once the
-      // job is done. Keep the pane (and don't delete the branch) if verification
-      // failed OR a code-change wasn't merged, so you can inspect/retry. Advisory
-      // and merged code-change reap fully, deleting the now-merged branch.
-      const cleanClose = verifyOk && (r.outputContract !== "code-change" || merged || r.status !== "success");
-      if (cleanClose) {
-        note += ` [reaped: pane closed, worktree + workspace removed]`;
-        await this.reap(ev.jobId, { deleteBranch: merged });
-      } else {
-        note += ` [kept: pane + worktree retained for inspection — reap manually when done]`;
-      }
-    } else if (ev.kind === "block") {
-      let question = "";
-      try {
-        const b = await readJSON<{ question: string }>(path.join(jobDir(ev.jobId), FILES.block));
-        question = b.question;
-      } catch {
-        /* block may have been consumed already */
-      }
-      toast = `delegate ${short}: BLOCKED`;
-      note =
-        `[peer-delegate] job ${short} is blocked and asks:\n"${question}"\n` +
-        `Answer it with the \`reply_delegate\` tool (jobId ${short}) to unblock it.`;
-    } else if (ev.kind === "stalled") {
-      toast = `delegate ${short}: STALLED`;
-      note =
-        `[peer-delegate] job ${short} appears STALLED — no heartbeat for >30s and no result ` +
-        `(delegate may have crashed or hung). Read its pane; reap_delegate to clean up, or ` +
-        `restart the job.`;
-    } else {
-      toast = `delegate ${short}: startup timeout`;
-      note = `[peer-delegate] job ${short} failed to start within its timeout.`;
-    }
-    try {
-      await this.client.tui.showToast({ body: { message: toast, variant: ev.kind === "result" ? "success" : "warning" } } as any);
-    } catch {
-      /* toast is best-effort */
-    }
-    // Deliver the note into opencode's native prompt QUEUE (runs when the current
-    // turn finishes) rather than injecting into the TUI text box where the user
-    // may be typing. Falls back to appendPrompt only if the session id is unknown.
-    let queued = false;
-    if (this.sessionId) {
-      try {
-        await this.client.session.promptAsync({
-          path: { id: this.sessionId },
-          body: { parts: [{ type: "text", text: note }] },
-        } as any);
-        queued = true;
-      } catch {
-        /* fall through to appendPrompt */
-      }
-    }
-    if (!queued) {
-      try {
-        await this.client.tui.appendPrompt({ body: { text: note } } as any);
-      } catch {
-        /* appendPrompt is best-effort */
-      }
     }
   }
+
+
+  // A delegate published result.json. Notify the coordinator agent DIRECTLY with
+  // the full report + context and let IT drive verify/merge/reap/re-prompt. The
+  // plugin does NOT auto-verify/merge/reap and does NOT delete result.json or the
+  // pane/worktree — the agent decides. Fired immediately by the fs.watcher.
+  async notifyResult(jobId: string, r: Result): Promise<void> {
+    const short = jobId.slice(0, 8);
+    const job = this.jobs.get(jobId);
+    const consumed = await this.loadConsumed(jobId);
+
+    try {
+      await this.client.tui.showToast({ body: { message: `delegate ${short}: ${r.status}`, variant: "success" } } as any);
+    } catch {
+      /* toast best-effort */
+    }
+
+    const lines: string[] = [];
+    lines.push(`[peer-delegate] Delegate job ${short} reported: ${r.status} (${r.outputContract}).`);
+    lines.push(`Summary: ${r.summary}`);
+    if (r.evidence?.length) lines.push(`Evidence:\n- ${r.evidence.join("\n- ")}`);
+    if (r.risks?.length) lines.push(`Risks:\n- ${r.risks.join("\n- ")}`);
+    if (r.followUps?.length) lines.push(`Follow-ups:\n- ${r.followUps.join("\n- ")}`);
+    if (r.outputContract === "code-change") {
+      lines.push(
+        `Code-change details: branch=${r.branch ?? "?"} base=${r.baseCommit ?? "?"} head=${r.headCommit ?? "?"}` +
+          (consumed?.targetBranch ? ` targetBranch=${consumed.targetBranch}` : ``) +
+          (consumed?.mergePolicy ? ` mergePolicy=${consumed.mergePolicy}` : ``),
+      );
+    }
+    if (job) {
+      lines.push(`Delegate pane ${job.pane ?? "?"} is still OPEN; worktree: ${job.worktree}.`);
+    }
+    lines.push(
+      `Decide what to do: review the deliverable; for code-change verify the commit(s) and merge ` +
+        `into the target if appropriate; then either \`reap_delegate\` (jobId ${short}) to close the ` +
+        `pane + worktree, or push more instructions to the delegate via \`herdr pane run ${job?.pane ?? "<pane>"} ...\`. ` +
+        `Report the outcome to the user.`,
+    );
+    await this.promptSelf(lines.join("\n"));
+  }
+
+  // A delegate is blocked awaiting an answer (block.json present). Notify the
+  // coordinator agent to answer via reply_delegate. Fired by the fs.watcher.
+  async notifyBlock(jobId: string): Promise<void> {
+    const short = jobId.slice(0, 8);
+    let question = "";
+    try {
+      const b = await readJSON<{ question: string }>(path.join(jobDir(jobId), FILES.block));
+      question = b.question;
+    } catch {
+      /* block may have been consumed already */
+    }
+    try {
+      await this.client.tui.showToast({ body: { message: `delegate ${short}: BLOCKED`, variant: "warning" } } as any);
+    } catch {
+      /* toast best-effort */
+    }
+    await this.promptSelf(
+      `[peer-delegate] Delegate job ${short} is BLOCKED and asks:\n"${question}"\n` +
+        `Answer it with the \`reply_delegate\` tool (jobId ${short}) to unblock it.`,
+    );
+  }
+
+  // Delegate appears stalled (no heartbeat, no result). Notify the agent.
+  async notifyStalled(jobId: string): Promise<void> {
+    const short = jobId.slice(0, 8);
+    const job = this.jobs.get(jobId);
+    try {
+      await this.client.tui.showToast({ body: { message: `delegate ${short}: STALLED`, variant: "warning" } } as any);
+    } catch {
+      /* toast best-effort */
+    }
+    await this.promptSelf(
+      `[peer-delegate] Delegate job ${short} appears STALLED — no heartbeat for >30s and no result ` +
+        `(it may have crashed or hung). Read its pane (${job?.pane ?? "?"}); \`reap_delegate\` (jobId ${short}) ` +
+        `to clean up, or push a nudge via \`herdr pane run ${job?.pane ?? "<pane>"} ...\`.`,
+    );
+  }
+
+  // Delegate failed to start within its timeout. Notify the agent.
+  async notifyStartupTimeout(jobId: string): Promise<void> {
+    const short = jobId.slice(0, 8);
+    const job = this.jobs.get(jobId);
+    try {
+      await this.client.tui.showToast({ body: { message: `delegate ${short}: startup timeout`, variant: "warning" } } as any);
+    } catch {
+      /* toast best-effort */
+    }
+    await this.promptSelf(
+      `[peer-delegate] Delegate job ${short} failed to start within its timeout. Read its pane ` +
+        `(${job?.pane ?? "?"}); \`reap_delegate\` (jobId ${short}) to clean up and optionally re-delegate.`,
+    );
+  }
+
 
   // Resolve a full jobId from a full id or its 8-char short prefix.
   resolveJobId(idOrPrefix: string): string | undefined {
@@ -268,7 +265,7 @@ export class Coordinator {
       this.startupTimers.delete(jobId);
       const consumedPath = path.join(jobDir(jobId), FILES.consumed);
       if (await exists(consumedPath)) return; // booted fine
-      this.enqueue({ kind: "startup-timeout", jobId, at: Date.now() });
+      void this.notifyStartupTimeout(jobId);
       try {
         // interrupt the pane's foreground process; leave the pane open.
         await this.$`herdr pane send-keys ${pane} C-c`.quiet();
@@ -308,7 +305,7 @@ export class Coordinator {
       }
       if (ageMs > stallSeconds * 1000) {
         this.stalledFired.add(jobId);
-        this.enqueue({ kind: "stalled", jobId, at: Date.now() });
+        void this.notifyStalled(jobId);
       }
     }, pollMs);
     (timer as any).unref?.();
@@ -341,7 +338,7 @@ export class Coordinator {
           this.startupTimers.delete(jobId);
         }
       }
-      // result → enqueue (once)
+      // result → notify coordinator directly (once)
       if (!seen.has("result") && (await exists(path.join(dir, FILES.result)))) {
         seen.add("result");
         // job finished — stop the liveness monitor
@@ -352,16 +349,16 @@ export class Coordinator {
         }
         try {
           const payload = await readJSON<Result>(path.join(dir, FILES.result));
-          this.enqueue({ kind: "result", jobId, at: Date.now(), payload });
+          void this.notifyResult(jobId, payload);
         } catch {
           seen.delete("result"); // partial; retry on next event
         }
       }
-      // block → enqueue each time a new block appears (delegate removes it on reply)
+      // block → notify each time a new block appears (delegate removes it on reply)
       if (await exists(path.join(dir, FILES.block))) {
         if (!seen.has("block")) {
           seen.add("block");
-          this.enqueue({ kind: "block", jobId, at: Date.now() });
+          void this.notifyBlock(jobId);
         }
       } else {
         seen.delete("block"); // block consumed; allow the next one
