@@ -92,6 +92,39 @@ export async function consume(jobDir: string): Promise<DelegateState> {
   return { jobDir, task: h.task, consumed };
 }
 
+// The `read_task` tool exposed to the delegate agent. The coordinator launches
+// the delegate with a tiny prompt telling it to call this first; that keeps the
+// (potentially huge) task text out of the shell command line entirely. Returns
+// the full task plus a standard working envelope. The task was already consumed
+// from handoff.json on boot (state.task).
+export function readTaskTool(state: DelegateState) {
+  return tool({
+    description:
+      "Read your delegated task. Call this FIRST, before doing anything else. Returns the full " +
+      "task brief you must carry out in this worktree.",
+    args: {},
+    async execute() {
+      const c = state.consumed;
+      const task = state.task;
+      if (!task) {
+        return "No task found (handoff not consumed). Ask the coordinator to re-delegate.";
+      }
+      const outputContract = c?.outputContract ?? "advisory";
+      const envelope =
+        `You are a delegated peer worker. Carry out the following task in this worktree.\n\n` +
+        `## Task\n${task}\n\n` +
+        `## When done\n` +
+        `Call the \`complete\` tool with a status ("success" or "failure") and a one-sentence summary` +
+        (outputContract === "code-change"
+          ? `, plus branch, baseCommit and headCommit for your commit.`
+          : ` (this is an advisory task — do NOT commit; return your deliverable in the summary/evidence).`) +
+        `\n` +
+        `If you get blocked and need a decision from the coordinator, call the \`ask\` tool.`;
+      return envelope;
+    },
+  });
+}
+
 // The `complete` tool exposed to the delegate agent.
 export function completeTool(state: DelegateState) {
   return tool({

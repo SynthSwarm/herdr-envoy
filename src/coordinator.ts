@@ -506,25 +506,23 @@ export class Coordinator {
       await $`direnv allow ${worktree}`.quiet().catch(() => {});
     }
     await this.waitForShellReady(newPane, cwdMarker);
-    // Task delivery rides in on the launch command: `opencode --prompt <task>`
-    // starts the first turn automatically (verified in trial). This replaces the
-    // old, racy post-boot keystroke injection (herdr agent send) entirely — a
-    // fresh TUI has no session to inject into until a turn starts, so launching
-    // WITH the prompt is the only reliable bootstrap.
+    // Task delivery rides in on the launch command, but we keep the launch prompt
+    // TINY: the full task (which can be huge) lives in the handoff the delegate
+    // already consumed on boot, and the delegate exposes a `read_task` tool. So we
+    // only tell the agent to call read_task first. This keeps arbitrary task text
+    // (quotes, newlines, length) off the shell command line entirely.
     // --auto: delegates are trusted same-user peers; auto-approve permissions so
     // the agent can write to its worktree + the job-dir without a blocking prompt
-    // (finding §11a.6).
-    const brief =
-      `You are a delegated peer worker. Your task:\n\n${input.task}\n\n` +
-      `Work in this worktree. When done, call the \`complete\` tool with status and a one-sentence summary` +
-      (input.outputContract === "code-change"
-        ? `, plus branch, baseCommit and headCommit for your commit.`
-        : `.`);
+    // (finding §11a.6). direnv + shell readiness are already handled above, so the
+    // coordinator's task never needs shell/startup boilerplate.
+    const bootPrompt =
+      `Call the \`read_task\` tool now to get your task, then carry it out in this worktree. ` +
+      `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`;
     // `herdr pane run` executes the string in the pane's shell, so the whole
-    // opencode invocation must be ONE shell-safe command. Single-quote the brief
-    // and escape any embedded single-quotes ('\'') so arbitrary task text is safe.
-    const safeBrief = `'${brief.replace(/'/g, `'\\''`)}'`;
-    const launchCmd = `opencode --agent ${input.agent} --auto --prompt ${safeBrief}`;
+    // opencode invocation must be ONE shell-safe command. Single-quote the prompt
+    // and escape any embedded single-quotes ('\'').
+    const safePrompt = `'${bootPrompt.replace(/'/g, `'\\''`)}'`;
+    const launchCmd = `opencode --agent ${input.agent} --auto --prompt ${safePrompt}`;
     await $`herdr pane run ${newPane} ${launchCmd}`.quiet();
     await $`herdr pane rename ${newPane} ${`${input.agent}-delegate`}`.quiet();
 

@@ -2,7 +2,7 @@
 // are opencode processes running this same code; JOBDIR_ENV decides the role.
 import type { Plugin, Hooks } from "@opencode-ai/plugin";
 import { JOBDIR_ENV } from "./protocol.js";
-import { consume, completeTool, askTool, startHeartbeat, type DelegateState } from "./delegate.js";
+import { consume, completeTool, askTool, readTaskTool, startHeartbeat, type DelegateState } from "./delegate.js";
 import { Coordinator, delegateTool, reapTool, replyTool } from "./coordinator.js";
 import { DELEGATE_COMMAND_NAME, delegateCommand } from "./command.js";
 import { provisionSkill } from "./skill.js";
@@ -22,6 +22,7 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
 
     const hooks: Hooks = {
       tool: {
+        read_task: readTaskTool(state),
         complete: completeTool(state),
         ask: askTool(state),
       },
