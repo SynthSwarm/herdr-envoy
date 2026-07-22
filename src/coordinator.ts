@@ -37,8 +37,16 @@ export class Coordinator {
   private queue: QueuedEvent[] = [];
   private watchers = new Map<string, FSWatcher>();
   private jobs = new Map<string, { agent: string; pane?: string; worktree: string; branch: string; repo: string; consumed?: Consumed; reaped?: boolean }>();
+  // The coordinator's own opencode session id, learned from session.idle events.
+  // Used to enqueue completion/block notes into opencode's native prompt QUEUE
+  // (session.promptAsync) instead of force-injecting into the TUI text box.
+  private sessionId: string | null = null;
 
   constructor(private $: Shell, private client: Client) {}
+
+  setSessionId(id: string) {
+    this.sessionId = id;
+  }
 
   enqueue(ev: QueuedEvent) {
     this.queue.push(ev);
@@ -146,10 +154,27 @@ export class Coordinator {
     } catch {
       /* toast is best-effort */
     }
-    try {
-      await this.client.tui.appendPrompt({ body: { text: note } } as any);
-    } catch {
-      /* appendPrompt is best-effort */
+    // Deliver the note into opencode's native prompt QUEUE (runs when the current
+    // turn finishes) rather than injecting into the TUI text box where the user
+    // may be typing. Falls back to appendPrompt only if the session id is unknown.
+    let queued = false;
+    if (this.sessionId) {
+      try {
+        await this.client.session.promptAsync({
+          path: { id: this.sessionId },
+          body: { parts: [{ type: "text", text: note }] },
+        } as any);
+        queued = true;
+      } catch {
+        /* fall through to appendPrompt */
+      }
+    }
+    if (!queued) {
+      try {
+        await this.client.tui.appendPrompt({ body: { text: note } } as any);
+      } catch {
+        /* appendPrompt is best-effort */
+      }
     }
   }
 
@@ -381,10 +406,64 @@ export class Coordinator {
     return { jobId, jobDir: dir };
   }
 
+  // Validate that the requested opencode agent actually exists (in the target
+  // repo's scope) BEFORE we create worktrees/panes — otherwise the delegate pane
+  // boots into an error and strands a worktree. `opencode agent list` prints one
+  // agent per line as "<name> (<kind>)"; we match the leading token.
+  async assertAgentExists(agent: string, repo: string): Promise<void> {
+    let listing: string;
+    try {
+      listing = await this.$`opencode agent list`.cwd(repo).text();
+    } catch (e) {
+      throw new Error(`peer-delegate: could not list opencode agents in ${repo}: ${(e as Error).message ?? e}`);
+    }
+    const names = new Set<string>();
+    for (const line of listing.split("\n")) {
+      const m = /^(\S+)\s+\((primary|subagent)\)\s*$/.exec(line.trim());
+      if (m) names.add(m[1]);
+    }
+    if (!names.has(agent)) {
+      const available = [...names].sort().join(", ") || "(none found)";
+      throw new Error(`peer-delegate: agent '${agent}' not found. Available agents: ${available}.`);
+    }
+  }
+
+  // Pick which pane to split and in which direction so the workspace stays
+  // balanced as delegates accumulate. Reads the current workspace layout, finds
+  // the pane with the largest area, and splits it along its longer axis:
+  //   width >= height  -> "right" (carve a new column)
+  //   height >  width   -> "down"  (carve a new row)
+  // Falls back to splitting the current pane "right" if the layout is unreadable.
+  async chooseSplitTarget(currentPane: string): Promise<{ targetPane: string; direction: "right" | "down" }> {
+    try {
+      const raw = await this.$`herdr pane layout --pane ${currentPane}`.text();
+      const layout = JSON.parse(raw)?.result?.layout;
+      const panes: Array<{ pane_id: string; rect: { width: number; height: number } }> = layout?.panes ?? [];
+      if (!panes.length) return { targetPane: currentPane, direction: "right" };
+      let best = panes[0];
+      let bestArea = best.rect.width * best.rect.height;
+      for (const p of panes) {
+        const area = p.rect.width * p.rect.height;
+        if (area > bestArea) {
+          best = p;
+          bestArea = area;
+        }
+      }
+      // Terminal cells are ~2x taller than wide; weight width so a "square-looking"
+      // pane in cells is actually wider on screen and splits into columns.
+      const direction: "right" | "down" = best.rect.width >= best.rect.height ? "right" : "down";
+      return { targetPane: best.pane_id, direction };
+    } catch {
+      return { targetPane: currentPane, direction: "right" };
+    }
+  }
+
   // Create worktree, split a pane in the current herdr workspace, boot the agent
   // with JOBDIR_ENV set so its plugin activates the delegate role.
   async spawnDelegate(jobId: string, input: { agent: string; repo: string; branch: string; task: string; outputContract: "advisory" | "code-change"; startupTimeoutSeconds?: number }): Promise<{ pane: string; worktree: string }> {
     const $ = this.$;
+    // Fail fast if the agent doesn't exist (before any worktree/pane creation).
+    await this.assertAgentExists(input.agent, input.repo);
     // Plain `git worktree add` — NOT `herdr worktree create` (which spins up an
     // orphan herdr workspace we'd have to clean up separately). We manage the
     // checkout ourselves under <repo>/.herdr-envoy/worktrees and split into the
@@ -406,15 +485,47 @@ export class Coordinator {
 
     const pane = process.env.HERDR_PANE_ID;
     if (!pane) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
-    const splitJson = await $`herdr pane split ${pane} --direction right --ratio 0.45 --cwd ${worktree} --no-focus --env ${`${JOBDIR_ENV}=${jobDir(jobId)}`}`.text();
+    // Balance the workspace: instead of always halving the CURRENT pane (which
+    // shrinks every subsequent delegate), analyze the layout, pick the pane with
+    // the most screen area, and split it along its LONGER axis (wide -> right,
+    // tall -> down). This spreads delegates evenly across the workspace.
+    const { targetPane, direction } = await this.chooseSplitTarget(pane);
+    const splitJson = await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${worktree} --no-focus --env ${`${JOBDIR_ENV}=${jobDir(jobId)}`}`.text();
     const newPane: string = JSON.parse(splitJson).result.pane.pane_id;
 
-    // Let the shell (.zshrc/direnv) initialize before running the command (learned in trial).
-    await new Promise((r) => setTimeout(r, 3000));
+    // Boot race (learned in trial): `pane run` blasts the command as keystrokes.
+    // If the interactive shell (zsh + direnv hook) hasn't finished initializing,
+    // the command gets mangled/echoed and opencode never launches ("agent never
+    // starts"). A fixed sleep is unreliable — direnv timing varies. Instead wait
+    // for the shell prompt to actually render (the cwd basename shows in the
+    // prompt) before running anything.
+    const cwdMarker = path.basename(worktree);
+    // If the worktree carries a .envrc, authorize it FIRST so the shell's direnv
+    // hook loads (not prompts) and settles before we launch opencode.
+    if (await exists(path.join(worktree, ".envrc"))) {
+      await $`direnv allow ${worktree}`.quiet().catch(() => {});
+    }
+    await this.waitForShellReady(newPane, cwdMarker);
+    // Task delivery rides in on the launch command: `opencode --prompt <task>`
+    // starts the first turn automatically (verified in trial). This replaces the
+    // old, racy post-boot keystroke injection (herdr agent send) entirely — a
+    // fresh TUI has no session to inject into until a turn starts, so launching
+    // WITH the prompt is the only reliable bootstrap.
     // --auto: delegates are trusted same-user peers; auto-approve permissions so
     // the agent can write to its worktree + the job-dir without a blocking prompt
     // (finding §11a.6).
-    await $`herdr pane run ${newPane} ${`opencode --agent ${input.agent} --auto`}`.quiet();
+    const brief =
+      `You are a delegated peer worker. Your task:\n\n${input.task}\n\n` +
+      `Work in this worktree. When done, call the \`complete\` tool with status and a one-sentence summary` +
+      (input.outputContract === "code-change"
+        ? `, plus branch, baseCommit and headCommit for your commit.`
+        : `.`);
+    // `herdr pane run` executes the string in the pane's shell, so the whole
+    // opencode invocation must be ONE shell-safe command. Single-quote the brief
+    // and escape any embedded single-quotes ('\'') so arbitrary task text is safe.
+    const safeBrief = `'${brief.replace(/'/g, `'\\''`)}'`;
+    const launchCmd = `opencode --agent ${input.agent} --auto --prompt ${safeBrief}`;
+    await $`herdr pane run ${newPane} ${launchCmd}`.quiet();
     await $`herdr pane rename ${newPane} ${`${input.agent}-delegate`}`.quiet();
 
     this.jobs.set(jobId, { agent: input.agent, pane: newPane, worktree, branch: input.branch, repo: input.repo });
@@ -422,26 +533,20 @@ export class Coordinator {
     this.armStartupTimeout(jobId, newPane, input.startupTimeoutSeconds ?? 30);
     this.armLiveness(jobId);
 
-    // Deliver the task via herdr agent send once the agent is idle-ready. The
-    // delegate already auto-consumed the handoff on boot; we send the task text
-    // (NOT a reference to handoff.json — finding §11a.4) so its context has it.
-    (async () => {
-      try {
-        await $`herdr agent wait ${newPane} --status idle --timeout 30000`.quiet();
-        const brief =
-          `You are a delegated peer worker. Your task:\n\n${input.task}\n\n` +
-          `Work in this worktree. When done, call the \`complete\` tool with status and a one-sentence summary` +
-          (input.outputContract === "code-change"
-            ? `, plus branch, baseCommit and headCommit for your commit.`
-            : `.`);
-        await $`herdr agent send ${newPane} ${brief}`.quiet();
-        await $`herdr pane send-keys ${newPane} Enter`.quiet();
-      } catch {
-        /* best-effort delivery; the delegate can also read its task from context */
-      }
-    })();
-
     return { pane: newPane, worktree };
+  }
+
+  // Wait until the pane's interactive shell has rendered its prompt (the cwd
+  // basename appears in the prompt line). Proves the shell + direnv hook finished
+  // so a following `pane run` won't race a still-initializing shell. Best-effort:
+  // falls back to a short fixed delay if the marker never shows.
+  private async waitForShellReady(pane: string, cwdMarker: string): Promise<void> {
+    try {
+      await this.$`herdr wait output ${pane} --match ${cwdMarker} --timeout 10000`.quiet();
+    } catch {
+      // Marker never matched (unusual prompt); settle briefly rather than blast.
+      await new Promise((r) => setTimeout(r, 1500));
+    }
   }
 
   dispose() {

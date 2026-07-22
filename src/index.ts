@@ -29,6 +29,10 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
     // Mid-run heartbeat so the coordinator can tell "working" from "crashed".
     const stopHeartbeat = startHeartbeat(delegateJobDir);
     hooks.dispose = async () => stopHeartbeat();
+    // Task delivery is handled entirely at launch: the coordinator boots this
+    // delegate with `opencode --agent X --auto --prompt <task>`, which starts the
+    // first turn automatically. No in-process injection needed (a fresh TUI has
+    // no session to promptAsync into until a turn starts — verified in trial).
     return hooks;
   }
 
@@ -59,6 +63,7 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
     // the user's current turn; surfaces completions as they arrive (spec §13).
     async event({ event }) {
       if (event.type === "session.idle") {
+        coord.setSessionId(event.properties.sessionID);
         for (const ev of coord.drain()) {
           await coord.surface(ev);
         }
