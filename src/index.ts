@@ -3,7 +3,7 @@
 import type { Plugin, Hooks } from "@opencode-ai/plugin";
 import { JOBDIR_ENV } from "./protocol.js";
 import { consume, completeTool, askTool, startHeartbeat, type DelegateState } from "./delegate.js";
-import { Coordinator, delegateTool, reapTool } from "./coordinator.js";
+import { Coordinator, delegateTool, reapTool, replyTool } from "./coordinator.js";
 import { DELEGATE_COMMAND_NAME, delegateCommand } from "./command.js";
 import { provisionSkill } from "./skill.js";
 
@@ -48,6 +48,7 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
     tool: {
       delegate: delegateTool(coord),
       reap_delegate: reapTool(coord),
+      reply_delegate: replyTool(coord),
     },
     // Ship the coordinator `/delegate` command WITH the plugin: inject it into
     // the config `command` map on load (no file install; agents stay the user's).

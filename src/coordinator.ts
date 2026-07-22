@@ -138,7 +138,7 @@ export class Coordinator {
       toast = `delegate ${short}: BLOCKED`;
       note =
         `[peer-delegate] job ${short} is blocked and asks:\n"${question}"\n` +
-        `Reply with the peer-delegate reply mechanism (coordinator.reply) to unblock it.`;
+        `Answer it with the \`reply_delegate\` tool (jobId ${short}) to unblock it.`;
     } else if (ev.kind === "stalled") {
       toast = `delegate ${short}: STALLED`;
       note =
@@ -619,6 +619,30 @@ export function reapTool(coord: Coordinator) {
       if (!jobId) return `No tracked job matching '${args.jobId}'.`;
       await coord.reap(jobId, { deleteBranch: args.deleteBranch });
       return `Reaped job ${jobId.slice(0, 8)}: pane closed, worktree + workspace removed.`;
+    },
+  });
+}
+
+// The `reply_delegate` tool: answer a blocked delegate that called `ask`. Writes
+// reply.json into the job-dir; the delegate is polling for it and unblocks on read.
+export function replyTool(coord: Coordinator) {
+  return tool({
+    description:
+      "Answer a blocked delegate that asked you a question (surfaced in a note). Unblocks the " +
+      "delegate so it can continue its task.",
+    args: {
+      jobId: z.string().describe("The job id (full or the 8-char short prefix shown in the block note)."),
+      answer: z.string().describe("Your answer to the delegate's question."),
+    },
+    async execute(args) {
+      const jobId = coord.resolveJobId(args.jobId);
+      if (!jobId) return `No tracked job matching '${args.jobId}'.`;
+      try {
+        await coord.reply(jobId, args.answer);
+      } catch (e) {
+        return `Could not reply to job ${jobId.slice(0, 8)}: ${(e as Error).message}`;
+      }
+      return `Replied to job ${jobId.slice(0, 8)}; the delegate will unblock and continue.`;
     },
   });
 }
