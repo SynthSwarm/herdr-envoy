@@ -13,6 +13,26 @@ export const JOBDIR_ENV = "PEER_DELEGATE_JOBDIR";
 
 export type OutputContract = "advisory" | "code-change";
 export type MergePolicy = "manual" | "auto-after-checks";
+export type Placement = "pane" | "subworkspace";
+export type SessionDisposition = "active" | "paused" | "commit" | "discard";
+
+export interface InteractiveSession {
+  protocolVersion: number;
+  jobId: string;
+  generation: number;
+  completionToken: string;
+  sessionID?: string;
+  status: SessionDisposition;
+  summary?: string;
+  checks?: string[];
+  risks?: string[];
+  userInstruction?: string;
+  handbackID?: string;
+}
+
+export function sessionRoot(): string {
+  return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "herdr-envoy", "sessions");
+}
 
 export interface Check {
   command: string;
@@ -32,6 +52,7 @@ export interface Handoff {
   mergePolicy: MergePolicy;
   checks: Check[];
   startupTimeoutSeconds: number;
+  mode?: "interactive";
 }
 
 export interface Result {
@@ -88,6 +109,7 @@ export interface Consumed {
   baseCommit: string;
   mergePolicy: MergePolicy;
   checks: Check[];
+  mode?: "interactive";
 }
 
 // $XDG_RUNTIME_DIR/herdr (fallback /tmp/herdr-$uid) — outside Git, per-user (spec §1).
@@ -135,6 +157,7 @@ export const FILES = {
   block: "block.json",
   reply: "reply.json",
   heartbeat: "heartbeat",
+  session: "session.json",
 } as const;
 
 export function filePath(jobId: string, name: keyof typeof FILES): string {

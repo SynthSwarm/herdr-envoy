@@ -11,17 +11,17 @@ export const SKILL_NAME = "envoy";
 
 const SKILL_MD = `---
 name: envoy
-description: Delegate a bounded task to a REAL peer opencode agent running in its own git worktree, spawned as a split pane, then monitor it asynchronously. Use when work should run in isolation on its own branch, in parallel, or as a long-running/attachable session — e.g. "delegate X to another agent", "spawn a worker on a worktree", "run these in parallel", "offload this and watch it". Requires herdr + the herdr-envoy plugin (provides delegate, reply_delegate and reap_delegate tools).
+description: Delegate bounded tasks or open durable interactive sessions with real peer opencode agents in isolated Git worktrees. Use for delegation, parallel work, or opening and resuming an attachable peer session in a pane or child workspace. Requires herdr and herdr-envoy (delegate, open_session, list_sessions, resume_session, reply_delegate and reap_delegate tools).
 license: MIT
 compatibility: opencode
 ---
 
 # envoy (coordinator)
 
-You are a delegation **coordinator**. You hand bounded tasks to **real peer opencode agents** —
-each a genuine separate process in its own git worktree + branch, spawned as a split pane. This is
-NOT a subagent: the delegate's checkout is separate and reviewable, and its pane can be inspected.
-Use it for isolated file edits, parallel fan-out, or long-running work you want to watch.
+You are a delegation **coordinator**. Peers are real separate opencode processes with their own
+Git worktree and branch, not subagents. Choose a bounded task or a durable interactive session
+independently of placement: both support a pane or a child workspace. Use them for isolated
+edits, parallel fan-out or interactive work that the user can pause and resume.
 
 The herdr-envoy plugin gives you the tools. You do NOT manage panes/worktrees yourself.
 
@@ -30,29 +30,51 @@ The herdr-envoy plugin gives you the tools. You do NOT manage panes/worktrees yo
 - Work benefits from isolation (its own branch) or from running several streams concurrently.
 - Prefer this over a subagent when you want a real, separate, attachable session.
 
-## How to delegate
-Call the \`delegate\` tool. Resolve these first:
+## Choose lifecycle and placement
+Use \`delegate\` for bounded work with a terminal completion report. Use \`open_session\` for
+durable interactive work. Neither lifecycle determines placement: both tools accept
+\`placement: "pane" | "subworkspace"\`, defaulting to \`pane\`.
+
+Resolve these creation arguments first:
 - \`agent\`: which of the USER'S OWN agents runs the task. Ask if unclear — never invent one.
 - \`task\`: complete, self-contained instructions. The delegate starts with NO context, so include
   everything it needs. Do not reference files it can't see.
 - \`repo\`: absolute path to the repository.
 - \`branch\`: a fresh branch, e.g. \`delegate/<short-slug>\`.
+- \`baseCommit\`: optional base, resolved to a commit SHA. Defaults to source repository HEAD.
+- \`targetBranch\`: optional intended merge target, never permission to merge.
+- \`placement\`: \`pane\` (default) or \`subworkspace\`.
+
+\`open_session\` also takes \`name\`, a display label, not a unique identifier. Its arguments are
+\`agent\`, \`task\`, \`name\`, \`repo\`, \`branch\`, optional \`baseCommit\`, optional \`targetBranch\`
+and \`placement\`. It does not take bounded output or merge contracts.
+
+For bounded \`delegate\` only:
 - \`outputContract\`: \`advisory\` (analysis/answer, no commits) or \`code-change\` (commits).
 - For \`code-change\`: specify the intended \`targetBranch\` and \`baseCommit\`, and use
   \`mergePolicy: "manual"\` (the default). \`auto-after-checks\` is explicitly rejected; the enum value is
   retained only to give existing callers a clear error. A supplied base is resolved to a commit
   SHA and used to create the fresh branch/worktree. If omitted, the base is the source repo's HEAD.
 
-\`delegate\` returns after launch setup, without waiting for completion. Tell the user it's running.
-**Do not block** waiting for it. Worktrees use \`<repo>/.herdr-envoy/worktrees/<job-id>/\`.
-The delegate reads the persisted brief with \`read_task\`, reports with \`complete\` and asks
-questions with \`ask\`. Do not tell it to read the already-consumed \`handoff.json\`.
+Creation returns after launch setup, without waiting for completion. Tell the user it's running.
+**Do not block** waiting for it. Pane placement uses \`<repo>/.herdr-envoy/worktrees/<job-id>/\`.
+Subworkspace placement uses herdr \`worktree create/open --workspace\` against the recorded parent,
+tracking the returned child workspace, root pane and checkout. Do not guess resource identities.
+Both peers read the persisted brief with \`read_task\`, not the already-consumed \`handoff.json\`.
+Bounded peers report with \`complete\` and ask questions with \`ask\`. Interactive peers expose
+\`read_task\` and \`hand_back\` only, with NO \`complete\` or \`ask\`.
 
 ## Monitoring and review
 Jobs bind to the tool context's \`sessionID\`. \`coordinator.json\` persists that owner, the project
 directory, coordinator/delegate panes and notification/cleanup progress. Filesystem watches are
-wake hints backed by 2-second reconciliation. Restart recovery requires the same project
+wake hints backed by 2-second reconciliation. Bounded restart recovery requires the same project
 directory and \`HERDR_PANE_ID\`. Legacy jobs without coordinator metadata cannot recover safely.
+
+Interactive metadata is durable at \`$XDG_STATE_HOME/herdr-envoy/sessions/<id>/\`, falling back
+to \`~/.local/state/herdr-envoy/sessions/<id>/\`. It retains owner/project, control, disposition,
+generation, peer conversation ID, placement and handback summary/checks/risks. Bounded runtime
+storage is unaffected. Interactive recovery is project-scoped without a coordinator-pane
+restriction. The original orchestrator owner is retained, never reassigned to the discoverer.
 
 Notes use persisted stable message IDs, readback and retries, with delivery deferred while the
 owning session is busy. This is not an exactly-once delivery guarantee. Interpret notes as follows:
@@ -66,17 +88,47 @@ owning session is busy. This is not an exactly-once delivery guarantee. Interpre
   startup timeout (default 30 seconds) notifies only and does not kill the delegate.
 
 For code changes, review the diff, run the required checks and obtain USER approval before
-merging. The plugin does not run project checks or automatically merge. Advisory content is
-trusted, not independently verified. Completion is terminal with no reopen operation; use a new
-job for follow-up work.
+merging. Never automatically merge or push. Advisory content is trusted, not independently
+verified. Bounded completion is terminal with no reopen operation; use a new job for follow-up.
+
+## Interactive handback and resume
+An interactive peer must call \`hand_back\` ONLY on explicit user instruction. Finishing the
+initial task, going idle or deciding the work looks ready is not a handback instruction.
+- "done for now": \`pause\` preserves the conversation, pane/workspace, checkout, branch and
+  metadata. Do not commit or reap.
+- "hand this back": \`commit\` returns control to the orchestrator, who reviews the diff, runs
+  required checks and commits in the session checkout BEFORE reaping. A failed review, check or
+  commit preserves the session. The peer does not commit or clean up merely because it hands back.
+- "discard this": \`discard\` records a discard request. Obtain separate explicit destructive
+  confirmation from the user in the orchestrator before removing work. The request is not consent.
+
+Handback includes summary, checks and risks. Use \`list_sessions\` to inspect durable interactive
+sessions for the current project owned by the calling orchestrator \`sessionID\`, with state and
+summary but no tokens. Recovery does not broaden listing scope.
+
+\`resume_session\` takes optional instructions and an optional full ID or unique prefix of at
+least eight characters. Omit ID only when exactly one eligible owned session exists. Do not
+auto-select an ambiguous name or candidate. Resume requires the originating orchestrator
+\`sessionID\` and continues the same peer conversation, worktree, branch and placement.
+Missing conversation, checkout or recorded parent workspace must cause a safe refusal, not a
+fresh conversation, replacement checkout or fallback placement. Preserve metadata for repair.
 
 ## Cleanup
-Completed jobs never auto-reap. Call \`reap_delegate\` with the job ID when inspection is finished
-and the checkout is no longer needed. It closes the pane first, then removes the clean checkout
-without force. Dirty work survives, and errors retain the tracked job for retry. Preserve that
-work before retrying. Optional \`deleteBranch\` defaults to false and uses \`git branch -d\`, not
-\`-D\`; an unmerged branch is retained if Git refuses deletion. Reply/reap tools are scoped to the
-calling session. Launch failures attempt cleanup, retaining the job if cleanup fails.
+Bounded completion never auto-reaps. Call \`reap_delegate\` when inspection is finished and the
+checkout is no longer needed. Interactive commit handback additionally requires orchestrator
+review, checks and commit first. Active or paused interactive sessions cannot be ordinarily reaped.
+Ordinary cleanup closes the pane, or the owned child workspace for subworkspace placement,
+BEFORE non-force Git cleanup. Never close the parent workspace. Dirty work survives and errors
+retain tracked progress for retry. Optional \`deleteBranch\` defaults to false and uses
+\`git branch -d\`, not \`-D\`; an unmerged branch is retained if Git refuses deletion.
+
+\`reap_delegate\` also takes \`discard: boolean\` (default false) and \`confirmation\`. Only a
+discard-requested interactive session can use force removal: obtain explicit destructive user
+confirmation in the orchestrator, then pass \`discard: true\` and \`confirmation\` equal to the
+EXACT FULL job ID. A prefix, name or generic approval is insufficient. Never force-remove a
+bounded, active or paused job. Branch deletion is a separate choice, not implied by discard.
+Reply/reap/resume and listing are caller-scoped. Launch failures attempt safe cleanup and retain
+the job if cleanup fails. Neither placement grants permission to discard work.
 
 ## Fan-out
 For multiple independent workstreams, call \`delegate\` several times (distinct branches) and

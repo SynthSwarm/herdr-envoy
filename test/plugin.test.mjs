@@ -13,7 +13,7 @@ import { provisionSkill, SKILL_NAME } from "../dist/skill.js";
 // These tests mutate process-wide environment and timer functions. Keep them serial.
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "envoy-plugin-test-"));
-  const keys = ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "HERDR_PANE_ID", JOBDIR_ENV];
+  const keys = ["HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "HERDR_PANE_ID", JOBDIR_ENV];
   const previous = new Map(keys.map((key) => [key, process.env[key]]));
   const hooks = [];
   t.after(async () => {
@@ -30,6 +30,7 @@ async function fixture(t) {
   process.env.HOME = path.join(dir, "home");
   process.env.XDG_CONFIG_HOME = path.join(dir, "config");
   process.env.XDG_RUNTIME_DIR = path.join(dir, "runtime");
+  process.env.XDG_STATE_HOME = path.join(dir, "state");
   process.env.HERDR_PANE_ID = "test-coordinator-pane";
   delete process.env[JOBDIR_ENV];
 
@@ -104,7 +105,7 @@ test("coordinator initialises recovery, provisions guidance and exposes only coo
   const hooks = await f.load();
   assert.equal(recover.mock.callCount(), 1);
   assert.deepEqual(Object.keys(hooks).sort(), ["config", "dispose", "tool"]);
-  assert.deepEqual(Object.keys(hooks.tool).sort(), ["delegate", "reap_delegate", "reply_delegate"]);
+  assert.deepEqual(Object.keys(hooks.tool).sort(), ["delegate", "list_sessions", "open_session", "reap_delegate", "reply_delegate", "resume_session"]);
   assert.match(await fs.readFile(f.skill, "utf8"), /name: envoy/);
   assert.equal(f.intervals.length, 1);
   const timer = f.intervals[0];
@@ -227,6 +228,24 @@ test("delegate consume failures leave usable read_task but no completion or ques
   }
 });
 
+test("interactive plugin exposes hand_back without complete, ask or an idle heartbeat", async (t) => {
+  const f = await fixture(t);
+  const { jobDir, brief } = await handoff(f, { mode: "interactive" });
+  await fs.writeFile(path.join(jobDir, FILES.session), JSON.stringify({
+    protocolVersion: brief.protocolVersion, jobId: brief.jobId, generation: brief.generation,
+    completionToken: brief.completionToken, status: "active",
+  }));
+  const hooks = await f.load();
+  assert.deepEqual(Object.keys(hooks.tool).sort(), ["hand_back", "read_task"]);
+  assert.equal(f.intervals.length, 0);
+  await hooks.tool.read_task.execute({}, { sessionID: "interactive-conversation" });
+  await hooks.tool.hand_back.execute({ disposition: "pause", summary: "Paused", userInstruction: "Done for now" }, { sessionID: "interactive-conversation" });
+  const state = JSON.parse(await fs.readFile(path.join(jobDir, FILES.session), "utf8"));
+  assert.equal(state.status, "paused");
+  assert.equal(state.sessionID, "interactive-conversation");
+  await hooks.dispose();
+});
+
 test("skill provisioning creates fresh guidance and leaves it untouched on repeat", async (t) => {
   const f = await fixture(t);
   assert.equal(SKILL_NAME, "envoy");
@@ -306,10 +325,10 @@ test("command and provisioned skill agree on delegation, recovery, review and sa
   const f = await fixture(t);
   await provisionSkill();
   assert.equal(DELEGATE_COMMAND_NAME, SKILL_NAME);
-  assert.match(delegateCommand.description, /real peer opencode agent.*git worktree/);
+  assert.match(delegateCommand.description, /interactive peer session.*git worktree/);
   assert.equal(delegateCommand.template.split("$ARGUMENTS").length - 1, 1);
   const sharedGuidance = [
-    /NOT a subagent/i,
+    /not (?:a )?subagents?/i,
     /USER'S OWN agents/,
     /`agent`/, /`task`/, /`repo`/, /`branch`/, /`outputContract`/,
     /`advisory`/, /`code-change`/, /`targetBranch`/, /`baseCommit`/,
@@ -324,12 +343,12 @@ test("command and provisioned skill agree on delegation, recovery, review and sa
     /not (?:an |promise )exactly-once delivery/i,
     /not code correctness/,
     /USER approval before merging/,
-    /Completion is terminal/,
+    /completion is terminal/i,
     /`delegate`/, /`reply_delegate`/, /`reap_delegate`/,
-    /closes the pane first/,
-    /clean checkout without force/,
-    /errors retain the tracked job for retry/i,
+    /non-force Git cleanup/,
+    /errors retain tracked (?:state|progress) for retry/i,
     /`git branch -d`, not `-D`/,
+    /`open_session`/, /`resume_session`/, /`hand_back`/, /`subworkspace`/,
     /distinct branches/,
   ];
   for (const [name, text] of [

@@ -1,10 +1,10 @@
 # herdr-envoy
 
-An [opencode](https://opencode.ai) plugin that lets a **coordinator** session delegate
-bounded tasks to **real peer opencode agents**, each running in its own **git worktree**,
-spawned as a split pane in the current [herdr](https://herdr.dev) workspace. The coordinator
-monitors them asynchronously and validates their reports. **It does not automatically merge
-or reap completed jobs.** Code changes require review, checks and user approval before merging.
+An [opencode](https://opencode.ai) plugin that lets a **coordinator** session delegate bounded
+tasks or open durable interactive sessions with **real peer opencode agents**, each in its own
+**git worktree**. Either lifecycle can use a split pane or a child [herdr](https://herdr.dev)
+workspace. Placement does not determine lifecycle. **There is no automatic merge or push.**
+Bounded completion never triggers cleanup. Interactive handback requires explicit user direction.
 
 Unlike a subagent, each delegate is a genuine separate agent process with its own context
 window and its own branch. Separate checkouts isolate file edits, and you can inspect each
@@ -41,7 +41,7 @@ The plugin is **dual-role**; it activates the right half automatically per proce
 coordinator guidance so a fresh install knows *how and when* to delegate — without touching your agents:
 
 - **`/envoy` command** — injected into your config on load (via the plugin's `config` hook). Type
-  `/envoy <what to delegate>` in the TUI to kick off a delegation. Won't override an `envoy`
+   `/envoy <what to delegate or open>` in the TUI to start peer work. Won't override an `envoy`
   command you already defined.
 - **`envoy` skill** — provisioned to `$XDG_CONFIG_HOME/opencode/skills/envoy/SKILL.md`
   (default `~/.config/opencode/skills/envoy/SKILL.md`) only if missing. Existing installed skills
@@ -69,21 +69,38 @@ opencode to load the changes.
 | `baseCommit` | Optional base revision, resolved to a commit SHA and used to create the branch/worktree. Defaults to source repo `HEAD`. |
 | `mergePolicy` | Defaults to `manual`. `auto-after-checks` is explicitly rejected. The enum value remains only to give existing callers a clear error. |
 | `startupTimeoutSeconds` | Defaults to 30. Timeout notifies only, without killing the delegate. |
+| `placement` | `pane` (default) or `subworkspace`, independently of the bounded lifecycle. |
 
 The call returns after launch setup, without waiting for completion. Jobs belong to the tool
 context's `sessionID`. Notes target that session, with delivery deferred while it is busy.
 
-- **`reap_delegate`** — explicitly close the pane, then remove the clean worktree without force
-  and clear runtime state. Errors retain the tracked job for retry. Optional `deleteBranch`
-  defaults to false and uses `git branch -d`, not `-D`; an unmerged branch is retained if Git
-  refuses deletion. Reply/reap tools only resolve jobs owned by the calling session.
+- **`open_session`** opens a durable interactive peer, not a bounded job. Arguments are `agent`,
+  `task`, `name`, `repo`, `branch`, optional `baseCommit` (defaults to source repo `HEAD`), optional
+  `targetBranch`, and `placement` (`pane` by default, or `subworkspace`). Agent, repository and
+  fresh-branch validation match `delegate`. The name is a display label, not a unique identity.
+- **`list_sessions`** lists durable interactive sessions for this project owned by the calling
+  orchestrator `sessionID`, including their IDs, state and handback summary. It exposes no tokens.
+- **`resume_session`** resumes the same interactive conversation, worktree, branch and placement,
+  with optional instructions and an optional full ID or unique prefix (at least eight characters).
+  It requires the originating orchestrator `sessionID`. Omit the ID only when there is exactly
+  one eligible session. Ambiguous names or candidates must not be auto-selected. A missing
+  conversation, checkout or recorded parent workspace causes a safe refusal, not a new session,
+  replacement worktree or fallback placement.
+- **`reap_delegate`** explicitly closes the owned pane or child workspace before Git cleanup.
+  Ordinary cleanup removes only a clean worktree without force. Optional `deleteBranch` defaults
+  to false and uses `git branch -d`, not `-D`. Errors retain the job for retry. Active or paused
+  interactive sessions cannot be ordinarily reaped. A commit handback must be reviewed, checked
+  and committed by the orchestrator before reaping. Destructive discard requires `discard: true`
+  (default false) and `confirmation` equal to the exact full job ID, after explicit destructive
+  confirmation from the user in the orchestrator. Only a discard-requested interactive session
+  can use this force-removal path. A delegate's discard request alone is not confirmation.
 
 - **`reply_delegate`** — answer a delegate that called `ask` and is blocked. Unblocks it so it can
   continue. Use this when a completion note reports a delegate is *blocked* on a question.
 
 ### Delegate tools (auto-available inside a delegated agent)
 
-When a delegate boots, the plugin consumes its brief and exposes:
+Bounded delegates consume their brief and expose:
 
 - **`read_task`** — read the persisted task and working instructions. Call this first.
 - **`complete`** — report the outcome (`status`, `summary`, and for code-change: `branch`,
@@ -91,19 +108,42 @@ When a delegate boots, the plugin consumes its brief and exposes:
   Completion is terminal, with no reopen operation. Use a new job for follow-up work.
 - **`ask`** — ask the coordinator a question and block until answered.
 
-Your delegate agents don't need to know any of the protocol — just tell them (in their own
-instructions) to do the task and call `complete` when done, or `ask` if blocked.
+Interactive delegates expose **only `read_task` and `hand_back`**, not `complete` or `ask`.
+They remain interactive until the user explicitly instructs handback. Finishing an initial task,
+going idle or deciding the work looks done is not permission to hand back.
+
+| User instruction | `hand_back` disposition | Orchestrator action |
+| --- | --- | --- |
+| "done for now" | `pause` | Preserve conversation, pane/workspace, checkout, branch and metadata for resume. |
+| "hand this back" | `commit` | Review changes, run checks and commit in the session checkout **before** reaping. Do not automatically merge or push. |
+| "discard this" | `discard` | Record a discard request. Ask for explicit destructive confirmation in the orchestrator before force removal. |
+
+Handback records a summary, checks and risks. The interactive peer does not commit or clean up
+merely because it hands back. Reply/reap/resume and listing remain scoped to the calling owner.
 
 ## How it works
 
-- **Disk protocol.** Per-job files live in `$XDG_RUNTIME_DIR/herdr/<job-id>/` (fallback
+- **Bounded disk protocol.** Per-job files remain in `$XDG_RUNTIME_DIR/herdr/<job-id>/` (fallback
   `<os.tmpdir()>/herdr-<uid>/herdr/<job-id>/`). They include `handoff.json`, `.consumed.json`,
   `coordinator.json`, `result.json`, `block.json`, `reply.json` and `heartbeat`.
-- **Ownership and recovery.** `coordinator.json` persists the originating session, project
+- **Interactive durability.** Session metadata lives in
+  `$XDG_STATE_HOME/herdr-envoy/sessions/<id>/`, falling back to
+  `~/.local/state/herdr-envoy/sessions/<id>/`. It records owner/project, lifecycle control,
+  disposition, generation, conversation ID, checkout/branch/placement and handback summary,
+  checks and risks. This does not move or change bounded runtime storage.
+- **Bounded ownership and recovery.** `coordinator.json` persists the originating session, project
   directory, coordinator/delegate panes, checkout and notification/cleanup progress. Filesystem
   watches are wake hints backed by 2-second reconciliation. Restart recovery requires the same
   project directory and `HERDR_PANE_ID`. Legacy jobs without coordinator metadata cannot be
   recovered safely and are skipped, not claimed by another session.
+- **Interactive recovery.** Recovery is project-scoped without a coordinator-pane restriction.
+  The original session owner is retained, not transferred to whichever session discovers it.
+  Durable metadata is not a backup of the conversation or checkout. Missing resources are
+   reported and preserved for repair, never silently replaced.
+- **Uncertain operations.** A partial workspace creation or uncertain interactive launch retains
+  metadata and resources for inspection instead of deleting them. Per-session coordinator locks
+  prevent concurrent updates. An incomplete lock requires inspection; a confirmed dead owner can
+  be recovered. Interrupted resumes retain their generation and can be retried with the full ID.
 - **Notifications.** Pending notes have persisted stable message IDs, readback and retries.
   Delivery is deferred while the owning session is busy; toasts are best-effort. This is not an
   exactly-once delivery guarantee. A stale heartbeat indicates a possible stall, not proof of a crash.
@@ -112,14 +152,18 @@ instructions) to do the task and call `complete` when done, or `ask` if blocked.
   base, head reachable from the assigned branch, base ancestry and a limited protocol-artifact
   filename check. This does not prove correctness or passing project checks. Advisory content is
   trusted. Review code changes, run required checks and obtain user approval before merging.
-- **Explicit cleanup.** Each fresh branch starts at the resolved base SHA in
-  `<repo>/.herdr-envoy/worktrees/<job-id>/`, using plain Git rather than a new herdr workspace.
-  Completion keeps the pane, worktree and result available for inspection. There is no automatic
-  merge or completion-triggered reap. Launch failures attempt cleanup; failures remain tracked.
+- **Placement.** `pane` uses plain Git at `<repo>/.herdr-envoy/worktrees/<job-id>/` and a split
+  pane in the current workspace. `subworkspace` uses `herdr worktree create/open --workspace`
+  with the recorded parent workspace and records the returned child workspace and root pane.
+  Cleanup closes that owned child workspace before non-force Git cleanup, not the parent.
+- **Explicit cleanup.** Bounded completion keeps the pane/workspace, checkout and result for
+  inspection. Interactive pause preserves everything. Launch failures attempt safe cleanup,
+  retaining tracked state on failure. Neither placement grants permission to discard work.
 
 ## Development
 
 - `npm test` builds and runs the regression suite using temporary Git repositories and mocked OpenCode/herdr boundaries.
+- `npm run test:bun` exercises cleanup with Bun's real shell parser (requires Bun), which the Node shell adapter does not emulate.
 - `npm run test:coverage` measures all compiled source modules, including the dormant merge helper, and enforces 95% line/function and 90% branch coverage. The suite is validated on Node.js 24, using its coverage and mock-timer APIs.
 - `npm run typecheck` checks TypeScript without emitting files.
 - Automated coverage does not replace a live herdr/OpenCode smoke test for pane startup and message processing.

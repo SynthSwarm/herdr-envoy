@@ -40,6 +40,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
+    "test:bun": "npm run build && bun test test/bun-shell.test.ts",
     "test:coverage": "npm run build && node --test --experimental-test-coverage --test-coverage-include='dist/*.js' --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=95 test/*.test.mjs",
     "prepublishOnly": "npm run build"
   },

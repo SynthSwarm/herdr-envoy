@@ -7,13 +7,25 @@ import { setImmediate as yieldIO } from "node:timers/promises";
 import { test } from "node:test";
 import {
   FILES, JOBDIR_ENV, PROTOCOL_VERSION, atomicWriteJSON, exists,
-  filePath, jobDir, rand, readJSON, root,
+  filePath, jobDir, rand, readJSON, root, sessionRoot,
 } from "../dist/protocol.js";
 import {
   askTool, completeTool, consume, readTaskTool, startHeartbeat,
 } from "../dist/delegate.js";
 
 const NOW = 1_800_000_000_000;
+
+test("interactive storage uses durable XDG state or home fallback rather than runtime", (t) => {
+  const previous = process.env.XDG_STATE_HOME;
+  t.after(() => {
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
+  });
+  process.env.XDG_STATE_HOME = "/example/state";
+  assert.equal(sessionRoot(), "/example/state/herdr-envoy/sessions");
+  delete process.env.XDG_STATE_HOME;
+  assert.equal(sessionRoot(), path.join(os.homedir(), ".local", "state", "herdr-envoy", "sessions"));
+});
 
 function handoff(overrides = {}) {
   return {
@@ -113,7 +125,7 @@ test("protocol constants and canonical paths use the configured runtime root", a
   assert.equal(jobDir("another-job"), path.join(f.dir, "herdr", "another-job"));
   assert.deepEqual(FILES, {
     handoff: "handoff.json", consumed: ".consumed.json", coordinator: "coordinator.json",
-    result: "result.json", block: "block.json", reply: "reply.json", heartbeat: "heartbeat",
+    result: "result.json", block: "block.json", reply: "reply.json", heartbeat: "heartbeat", session: "session.json",
   });
   for (const [name, filename] of Object.entries(FILES)) {
     assert.equal(filePath("another-job", name), path.join(f.dir, "herdr", "another-job", filename));

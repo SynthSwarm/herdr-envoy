@@ -18,6 +18,7 @@ async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "envoy-test-"));
   const env = { ...process.env };
   process.env.XDG_RUNTIME_DIR = path.join(dir, "runtime");
+  process.env.XDG_STATE_HOME = path.join(dir, "state");
   process.env.HERDR_PANE_ID = "coordinator-pane";
   const repo = path.join(dir, "repo");
   await fs.mkdir(repo);
@@ -46,6 +47,8 @@ async function fixture(t) {
   let pane = 0;
   const panes = new Set();
   const shell = (strings, ...values) => {
+    // Bun parses literal shell syntax before interpolation. execFile alone misses this.
+    assert.ok(strings.every((literal) => !literal.includes("%(refname)")), "Git format parentheses must be passed through interpolation, not literal shell syntax");
     // Preserve interpolation boundaries just like Bun's tagged shell.
     const words = [];
     strings.forEach((literal, i) => {
@@ -135,7 +138,7 @@ async function fixture(t) {
   t.after(async () => {
     for (const coord of coordinators) await coord.dispose();
     await fs.rm(dir, { recursive: true, force: true });
-    for (const key of ["XDG_RUNTIME_DIR", "HERDR_PANE_ID"]) {
+    for (const key of ["XDG_RUNTIME_DIR", "XDG_STATE_HOME", "HERDR_PANE_ID"]) {
       if (env[key] === undefined) delete process.env[key];
       else process.env[key] = env[key];
     }
@@ -676,7 +679,7 @@ test("invalid owners and relative repositories fail before agent discovery", asy
   const job = await f.c.createJob(f.input);
   delete process.env.HERDR_PANE_ID;
   await assert.rejects(f.c.spawnDelegate(job.jobId, f.input), /HERDR_PANE_ID missing/);
-  assert.equal((await f.metadata(job)).worktreeCreated, undefined);
+  await assert.rejects(f.metadata(job), { code: "ENOENT" });
 });
 
 test("spawn authorises .envrc and uses a mocked readiness fallback before launching a shell-safe tiny prompt", async (t) => {

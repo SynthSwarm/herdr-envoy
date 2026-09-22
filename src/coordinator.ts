@@ -19,6 +19,9 @@ import {
   rand,
   readJSON,
   root,
+  sessionRoot,
+  type InteractiveSession,
+  type Placement,
   type Consumed,
   type Handoff,
   type Result,
@@ -45,6 +48,15 @@ interface Job {
   delivered: string[];
   pending?: { key: string; messageID: string; text: string; attemptedAt?: number };
   consumed?: Consumed;
+  mode?: "interactive";
+  name?: string;
+  placement?: Placement;
+  parentWorkspace?: string;
+  workspace?: string;
+  discard?: boolean;
+  launchAttempted?: boolean;
+  resourceUncertain?: boolean;
+  resuming?: { generation: number; instructions?: string };
 }
 
 export class Coordinator {
@@ -52,37 +64,87 @@ export class Coordinator {
   private jobs = new Map<string, Job>();
   private scans = new Map<string, Promise<void>>();
   private cleanups = new Map<string, Promise<void>>();
+  private resumes = new Map<string, Promise<string>>();
+  private transactions = new Map<string, Promise<unknown>>();
   private messageClock = 0n;
   private disposed = false;
   private reconcileTimer?: ReturnType<typeof setInterval>;
 
   constructor(private $: Shell, private client: Client, private directory: string) {}
 
+  private dir(jobId: string): string {
+    return this.jobs.get(jobId)?.mode === "interactive" ? path.join(sessionRoot(), jobId) : jobDir(jobId);
+  }
+
   private async save(job: Job) {
     // Auth stays in .consumed.json, not coordinator metadata.
     const { consumed, ...metadata } = job;
-    await atomicWriteJSON(path.join(jobDir(job.jobId), FILES.coordinator), metadata);
+    const dir = job.mode === "interactive" ? path.join(sessionRoot(), job.jobId) : jobDir(job.jobId);
+    await atomicWriteJSON(path.join(dir, FILES.coordinator), metadata);
+  }
+
+  private async exclusive<T>(jobId: string, action: () => Promise<T>): Promise<T> {
+    if (this.jobs.get(jobId)?.mode !== "interactive") return action();
+    const previous = this.transactions.get(jobId) ?? Promise.resolve();
+    const transaction = previous.catch(() => {}).then(() => this.locked(jobId, action));
+    this.transactions.set(jobId, transaction);
+    try { return await transaction; }
+    finally { if (this.transactions.get(jobId) === transaction) this.transactions.delete(jobId); }
+  }
+
+  private async locked<T>(jobId: string, action: () => Promise<T>): Promise<T> {
+    if (!this.jobs.has(jobId)) throw new Error("Session was removed by another operation");
+    const locks = path.join(sessionRoot(), ".locks");
+    await fs.mkdir(locks, { recursive: true, mode: 0o700 });
+    const lock = path.join(locks, jobId);
+    let handle;
+    try {
+      handle = await fs.open(lock, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const pid = Number(await fs.readFile(lock, "utf8"));
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Session lock is incomplete; inspect before recovery");
+      try { process.kill(pid, 0); }
+      catch (probe) {
+        if ((probe as NodeJS.ErrnoException).code !== "ESRCH") throw probe;
+        await fs.unlink(lock);
+        return this.locked(jobId, action);
+      }
+      throw new Error("Session is being updated by another coordinator; retry later");
+    }
+    try {
+      await handle.writeFile(String(process.pid));
+      const metadata = await readJSON<Job>(path.join(this.dir(jobId), FILES.coordinator));
+      this.jobs.set(jobId, metadata);
+      return await action();
+    } finally {
+      await handle.close();
+      await fs.unlink(lock);
+    }
   }
 
   async recover(): Promise<void> {
-    const entries = await fs.readdir(root(), { withFileTypes: true }).catch((error) => {
-      if (error.code === "ENOENT") return [];
-      throw error;
-    });
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
-      const metadata = path.join(jobDir(entry.name), FILES.coordinator);
-      if (!(await exists(metadata))) continue; // Legacy jobs have no safe session owner.
-      try {
-        const job = await readJSON<Job>(metadata);
-        if (job.directory !== this.directory || job.coordinatorPane !== process.env.HERDR_PANE_ID) continue;
-        if (job.jobId !== entry.name || !job.sessionID || !Array.isArray(job.delivered)) {
-          throw new Error("invalid coordinator metadata");
+    for (const directory of [root(), sessionRoot()]) {
+      const entries = await fs.readdir(directory, { withFileTypes: true }).catch((error) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
+        const metadata = path.join(directory, entry.name, FILES.coordinator);
+        if (!(await exists(metadata))) continue; // Legacy jobs have no safe session owner.
+        try {
+          const job = await readJSON<Job>(metadata);
+          if (job.directory !== this.directory || (job.mode !== "interactive" && job.coordinatorPane !== process.env.HERDR_PANE_ID)) continue;
+          if ((job.mode === "interactive") !== (directory === sessionRoot())) continue;
+          if (job.jobId !== entry.name || !job.sessionID || !Array.isArray(job.delivered)) {
+            throw new Error("invalid coordinator metadata");
+          }
+          this.jobs.set(job.jobId, job);
+          this.watchJob(job.jobId);
+        } catch (error) {
+          console.error(`herdr-envoy: cannot recover ${entry.name}:`, error);
         }
-        this.jobs.set(job.jobId, job);
-        this.watchJob(job.jobId);
-      } catch (error) {
-        console.error(`herdr-envoy: cannot recover ${entry.name}:`, error);
       }
     }
     this.reconcileTimer ??= setInterval(() => {
@@ -196,7 +258,7 @@ export class Coordinator {
     const short = jobId.slice(0, 8);
     let question = "";
     try {
-      const b = await readJSON<{ question: string }>(path.join(jobDir(jobId), FILES.block));
+      const b = await readJSON<{ question: string }>(path.join(this.dir(jobId), FILES.block));
       question = b.question;
     } catch {
       /* block may have been consumed already */
@@ -251,10 +313,103 @@ export class Coordinator {
     return matches.length === 1 ? matches[0] : undefined;
   }
 
+  private async readSession(job: Job): Promise<InteractiveSession> {
+    const dir = this.dir(job.jobId);
+    const session = await readJSON<InteractiveSession>(path.join(dir, FILES.session));
+    const auth = await this.loadConsumed(job.jobId) ?? await readJSON<Handoff>(path.join(dir, FILES.handoff));
+    if (session.protocolVersion !== PROTOCOL_VERSION || session.jobId !== job.jobId ||
+        session.completionToken !== auth.completionToken || !Number.isSafeInteger(session.generation) ||
+        session.generation < auth.generation || !["active", "paused", "commit", "discard"].includes(session.status)) {
+      throw new Error("Invalid interactive session identity or state");
+    }
+    return session;
+  }
+
+  async listSessions(sessionID: string): Promise<string> {
+    const sessions = [];
+    for (const job of this.jobs.values()) {
+      if (job.mode !== "interactive" || job.sessionID !== sessionID) continue;
+      const state = await this.readSession(job);
+      sessions.push({ jobId: job.jobId, name: job.name, status: state.status, phase: job.phase,
+        placement: job.placement, worktree: job.worktree, branch: job.branch,
+        pane: job.pane, workspace: job.workspace, sessionID: state.sessionID, summary: state.summary });
+    }
+    return JSON.stringify(sessions, null, 2);
+  }
+
+  async resolveSession(sessionID: string, id?: string): Promise<string> {
+    if (id) {
+      const match = this.resolveJobId(id, sessionID);
+      if (match && this.jobs.get(match)?.mode === "interactive") return match;
+      throw new Error("No uniquely matching session owned by this orchestrator");
+    }
+    const candidates = [];
+    for (const job of this.jobs.values()) {
+      if (job.mode === "interactive" && job.sessionID === sessionID && job.phase !== "cleanup" &&
+          (await this.readSession(job)).status === "paused") candidates.push(job.jobId);
+    }
+    if (candidates.length !== 1) throw new Error("Specify a session ID: expected exactly one paused session");
+    return candidates[0];
+  }
+
+  async resumeSession(jobId: string, instructions?: string): Promise<string> {
+    const existing = this.resumes.get(jobId);
+    if (existing) return existing;
+    const resume = this.exclusive(jobId, () => this.resume(jobId, instructions)).finally(() => this.resumes.delete(jobId));
+    this.resumes.set(jobId, resume);
+    return resume;
+  }
+
+  private async resume(jobId: string, instructions?: string): Promise<string> {
+    const job = this.jobs.get(jobId);
+    if (!job || job.mode !== "interactive" || job.phase === "cleanup") throw new Error("No resumable interactive session");
+    if (job.pending) throw new Error("Hand-back delivery is pending. Retry resume after it is acknowledged.");
+    const state = await this.readSession(job);
+    if (state.status !== "paused" && !(job.resuming && state.status === "active")) throw new Error("Only paused sessions can be resumed");
+    if (!state.sessionID) throw new Error("Saved conversation identity is missing; refusing to create a substitute");
+    if (!(await exists(job.worktree))) throw new Error("Saved worktree is missing; refusing to create a substitute");
+    const branch = (await this.$`git -C ${job.worktree} symbolic-ref --short HEAD`.text()).trim();
+    if (branch !== job.branch) throw new Error("Saved worktree branch has changed");
+    const conversation = await this.client.session.get({ path: { id: state.sessionID }, query: { directory: job.worktree }, throwOnError: true });
+    if (conversation.data?.id !== state.sessionID || conversation.data.directory !== job.worktree) throw new Error("Saved conversation does not belong to this worktree");
+    const panes = JSON.parse(await this.$`herdr pane list`.text()).result?.panes;
+    if (!Array.isArray(panes)) throw new Error("Cannot inspect existing panes");
+    const pane = panes.find((p: { pane_id: string }) => p.pane_id === job.pane);
+    if (pane && (pane.agent !== "opencode" || pane.agent_session?.value !== state.sessionID || pane.agent_status === "working")) {
+      throw new Error("Saved pane is busy or its conversation identity cannot be verified. Close it before reopening the saved conversation.");
+    }
+    const resumed: InteractiveSession = { ...state, status: "active", generation: job.resuming?.generation ?? state.generation + 1 };
+    job.resuming = { generation: resumed.generation, instructions };
+    await this.save(job);
+    await atomicWriteJSON(path.join(this.dir(jobId), FILES.session), resumed);
+    const prompt = "Resume the saved interactive session. Call read_task to refresh control before continuing. " + (instructions ?? "Wait for the user's next instruction.");
+    try {
+      if (pane) {
+        await this.$`herdr agent prompt ${job.pane!} ${prompt}`.quiet();
+      } else {
+        job.pane = undefined;
+        await this.place(job, true);
+        await this.launch(job, prompt, state.sessionID);
+      }
+      await this.save(job);
+      job.resuming = undefined;
+      await this.save(job);
+    } catch (error) {
+      const current = await this.readSession(job);
+      if (current.status === "active" && current.generation === resumed.generation) {
+        await atomicWriteJSON(path.join(this.dir(jobId), FILES.session), { ...current, status: "paused" });
+      }
+      job.resuming = undefined;
+      await this.save(job);
+      throw new Error(`Resume failed; work is preserved. Inspect the saved session before retrying: ${error}`);
+    }
+    return `Resumed ${job.name} (${jobId}) in pane ${job.pane}. Worktree: ${job.worktree}`;
+  }
+
   private async loadConsumed(jobId: string): Promise<Consumed | null> {
     const job = this.jobs.get(jobId);
     if (job?.consumed) return job.consumed;
-    const p = path.join(jobDir(jobId), FILES.consumed);
+    const p = path.join(this.dir(jobId), FILES.consumed);
     if (!(await exists(p))) return null;
     const c = await readJSON<Consumed>(p);
     if (job) job.consumed = c;
@@ -266,7 +421,7 @@ export class Coordinator {
   async reply(jobId: string, answer: string): Promise<void> {
     const consumed = await this.loadConsumed(jobId);
     if (!consumed) throw new Error(`peer-delegate: no job ${jobId.slice(0, 8)}`);
-    await atomicWriteJSON(path.join(jobDir(jobId), FILES.reply), {
+    await atomicWriteJSON(path.join(this.dir(jobId), FILES.reply), {
       protocolVersion: PROTOCOL_VERSION,
       jobId,
       generation: consumed.generation,
@@ -276,24 +431,44 @@ export class Coordinator {
   }
 
   // Persist each successful cleanup step. Stop on failure and retain the job.
-  async reap(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean } = {}): Promise<void> {
+  async reap(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean; discard?: boolean; confirmation?: string } = {}): Promise<void> {
     const running = this.cleanups.get(jobId);
     if (running) return running;
-    const cleanup = this.cleanup(jobId, opts).finally(() => this.cleanups.delete(jobId));
+    const cleanup = this.exclusive(jobId, () => this.cleanup(jobId, opts)).finally(() => this.cleanups.delete(jobId));
     this.cleanups.set(jobId, cleanup);
     return cleanup;
   }
 
-  private async cleanup(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean }): Promise<void> {
+  private async cleanup(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean; discard?: boolean; confirmation?: string }): Promise<void> {
     const $ = this.$;
     const job = this.jobs.get(jobId);
     if (!job) return;
+    if (this.resumes.has(jobId)) throw new Error("Session is being resumed; retry cleanup afterwards");
+    if (job.resourceUncertain) throw new Error(`Resource creation is uncertain for ${jobId}; inspect herdr worktrees before cleanup`);
     if (opts.keepPane) throw new Error("Cannot remove a checkout while retaining its delegate pane");
+    if (job.mode === "interactive" && (job.phase !== "starting" || job.launchAttempted)) {
+      const session = await this.readSession(job);
+      if (session.status === "active" || session.status === "paused") throw new Error("Active or paused sessions must be handed back before cleanup");
+      if (session.status === "discard" && !job.discard && (!opts.discard || opts.confirmation !== jobId)) {
+        throw new Error(`Confirm destructive discard with discard=true and confirmation=${jobId} only after user approval`);
+      }
+      if (opts.discard && session.status !== "discard") throw new Error("Session has not requested discard");
+      job.discard ||= opts.discard;
+    } else if (opts.discard) throw new Error("Discard requires an interactive discard request");
     job.phase = "cleanup";
     job.deleteBranch ||= opts.deleteBranch;
-    await this.scans.get(jobId);
+    if (job.mode !== "interactive") await this.scans.get(jobId);
     await this.save(job);
-    if (job.pane) {
+    if (job.workspace) {
+      const workspaces = JSON.parse(await $`herdr workspace list`.text()).result?.workspaces;
+      if (!Array.isArray(workspaces)) throw new Error("Cannot establish whether delegate workspace exists");
+      if (workspaces.some((workspace: { workspace_id: string }) => workspace.workspace_id === job.workspace)) {
+        await $`herdr workspace close ${job.workspace}`.quiet();
+      }
+      job.workspace = undefined;
+      job.pane = undefined;
+      await this.save(job);
+    } else if (job.pane) {
       const panes = JSON.parse(await $`herdr pane list`.text()).result?.panes;
       if (!Array.isArray(panes)) throw new Error("Cannot establish whether delegate pane exists");
       if (panes.some((pane: { pane_id: string }) => pane.pane_id === job.pane)) {
@@ -304,18 +479,24 @@ export class Coordinator {
     }
     if (job.worktreeCreated) {
       // No --force: uncommitted or untracked work must survive cleanup.
-      if (await exists(job.worktree)) await $`git -C ${job.repo} worktree remove ${job.worktree}`.quiet();
+      if (await exists(job.worktree)) {
+        if (job.discard) await $`git -C ${job.repo} worktree remove --force ${job.worktree}`.quiet();
+        else await $`git -C ${job.repo} worktree remove ${job.worktree}`.quiet();
+      }
       await $`git -C ${job.repo} worktree prune`.quiet();
       job.worktreeCreated = false;
       await this.save(job);
     }
     if (job.deleteBranch && job.branchCreated) {
-      const branches = (await $`git -C ${job.repo} for-each-ref --format=%(refname) refs/heads/`.text()).split("\n");
-      if (branches.includes(`refs/heads/${job.branch}`)) await $`git -C ${job.repo} branch -d ${job.branch}`.quiet();
+      const branches = (await $`git -C ${job.repo} for-each-ref ${"--format=%(refname)"} refs/heads/`.text()).split("\n");
+      if (branches.includes(`refs/heads/${job.branch}`)) {
+        if (job.discard) await $`git -C ${job.repo} branch -D ${job.branch}`.quiet();
+        else await $`git -C ${job.repo} branch -d ${job.branch}`.quiet();
+      }
       job.branchCreated = false;
       await this.save(job);
     }
-    await fs.rm(jobDir(jobId), { recursive: true, force: true });
+    await fs.rm(this.dir(jobId), { recursive: true, force: true });
     this.watchers.get(jobId)?.close();
     this.watchers.delete(jobId);
     this.jobs.delete(jobId);
@@ -325,7 +506,7 @@ export class Coordinator {
   private watchJob(jobId: string) {
     if (this.watchers.has(jobId)) return;
     try {
-      const watcher = watch(jobDir(jobId), () => void this.reconcile(jobId));
+      const watcher = watch(this.dir(jobId), () => void this.reconcile(jobId));
       watcher.on("error", (error) => {
         console.error(`herdr-envoy: watch failed for ${jobId}:`, error);
         watcher.close();
@@ -340,16 +521,37 @@ export class Coordinator {
 
   async reconcile(jobId: string): Promise<void> {
     if (this.disposed) return;
+    if (this.resumes.has(jobId) || this.cleanups.has(jobId)) return;
     const existing = this.scans.get(jobId);
     if (existing) return existing;
-    const scan = (async () => {
+    const scan = this.exclusive(jobId, async () => {
       const job = this.jobs.get(jobId);
       if (!job || job.phase === "cleanup") return;
       if (job.pending) {
         await this.promptSelf(jobId, job.pending.key, job.pending.text);
         if (job.pending) return;
       }
-      const dir = jobDir(jobId);
+      const dir = this.dir(jobId);
+      if (job.mode === "interactive") {
+        const session = await this.readSession(job);
+        if (job.resuming && session.status === "active") return;
+        if (job.resuming) {
+          job.resuming = undefined;
+          await this.save(job);
+        }
+        if (session.status !== "active" && session.handbackID) {
+          const key = `handback:${session.handbackID}`;
+          const instruction = session.status === "paused"
+            ? "PAUSED. Preserve the conversation, checkout and branch. Do not commit, merge or reap. Use resume_session to continue."
+            : session.status === "commit"
+              ? "READY FOR COMMIT. Review the diff and run checks, then commit in the worktree BEFORE reap_delegate. No merge or push is authorised."
+              : `DISCARD REQUESTED. Ask the user to confirm deletion of this checkout and any unwanted commits. Only then reap_delegate with discard=true, confirmation=${jobId}, and deleteBranch if approved.`;
+          await this.promptSelf(jobId, key, `[peer-session] ${job.name} (${jobId}): ${instruction}\nSummary: ${session.summary}\nChecks: ${(session.checks ?? []).join("; ")}\nRisks: ${(session.risks ?? []).join("; ")}\nWorktree: ${job.worktree}\nBranch: ${job.branch}\nUser instruction: ${session.userInstruction}`);
+        } else if (!session.sessionID && Date.now() - job.createdAt > job.startupTimeoutSeconds * 1000 && !job.delivered.includes("startup-timeout")) {
+          await this.notifyStartupTimeout(jobId);
+        }
+        return; // Idle interactive conversations are not stalled jobs.
+      }
       if (await exists(path.join(dir, FILES.result))) {
         if (!job.delivered.includes("result")) await this.notifyResult(jobId, await readJSON<Result>(path.join(dir, FILES.result)));
         return;
@@ -368,7 +570,7 @@ export class Coordinator {
       }
       const heartbeat = await stat(path.join(dir, FILES.heartbeat)).catch(() => stat(path.join(dir, FILES.consumed)));
       if (Date.now() - heartbeat.mtimeMs > 30_000 && !job.delivered.includes("stalled")) await this.notifyStalled(jobId);
-    })().catch((error) => {
+    }).catch((error) => {
       console.error(`herdr-envoy: reconciliation failed for ${jobId}, will retry:`, error);
     }).finally(() => this.scans.delete(jobId));
     this.scans.set(jobId, scan);
@@ -387,6 +589,9 @@ export class Coordinator {
     startupTimeoutSeconds?: number;
     sessionID: string;
     branch: string;
+    placement?: Placement;
+    mode?: "interactive";
+    name?: string;
   }): Promise<{ jobId: string; jobDir: string }> {
     if (input.mergePolicy === "auto-after-checks") throw new Error("auto-after-checks is not implemented. Use manual and review/check the result before merging.");
     if (!process.env.HERDR_PANE_ID) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
@@ -397,7 +602,7 @@ export class Coordinator {
     if (branchExists) throw new Error(`Branch already exists: ${input.branch}. Use a fresh branch.`);
     const baseCommit = (await this.$`git -C ${input.repo} rev-parse --verify --end-of-options ${`${input.baseCommit ?? "HEAD"}^{commit}`}`.text()).trim();
     const jobId = rand();
-    const dir = jobDir(jobId);
+    const dir = input.mode === "interactive" ? path.join(sessionRoot(), jobId) : jobDir(jobId);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.chmod(dir, 0o700);
 
@@ -414,6 +619,7 @@ export class Coordinator {
       mergePolicy: "manual",
       checks: input.checks ?? [],
       startupTimeoutSeconds: input.startupTimeoutSeconds ?? 30,
+      ...(input.mode ? { mode: input.mode } : {}),
     };
     await atomicWriteJSON(path.join(dir, FILES.handoff), handoff);
     const job: Job = {
@@ -422,7 +628,15 @@ export class Coordinator {
       worktree: path.join(input.repo, ".herdr-envoy", "worktrees", jobId),
       createdAt: Date.now(), startupTimeoutSeconds: handoff.startupTimeoutSeconds,
       phase: "starting", delivered: [],
+      ...(input.mode ? { mode: input.mode, name: input.name } : {}),
+      placement: input.placement ?? "pane",
     };
+    if (input.mode === "interactive") {
+      await atomicWriteJSON(path.join(dir, FILES.session), {
+        protocolVersion: PROTOCOL_VERSION, jobId, generation: 1,
+        completionToken: handoff.completionToken, status: "active",
+      } satisfies InteractiveSession);
+    }
     await this.save(job);
     this.jobs.set(jobId, job);
     return { jobId, jobDir: dir };
@@ -481,57 +695,93 @@ export class Coordinator {
   // Create worktree, split a pane in the current herdr workspace, boot the agent
   // with JOBDIR_ENV set so its plugin activates the delegate role.
   async spawnDelegate(jobId: string, input: { agent: string; repo: string; branch: string; task: string; outputContract: "advisory" | "code-change"; startupTimeoutSeconds?: number }): Promise<{ pane: string; worktree: string }> {
-    const $ = this.$;
+    return this.exclusive(jobId, () => this.spawn(jobId));
+  }
+
+  private async spawn(jobId: string): Promise<{ pane: string; worktree: string }> {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error(`Unknown job ${jobId}`);
-    // Plain `git worktree add` — NOT `herdr worktree create` (which spins up an
-    // orphan herdr workspace we'd have to clean up separately). We manage the
-    // checkout ourselves under <repo>/.herdr-envoy/worktrees and split into the
-    // CURRENT herdr workspace. No herdr worktree/workspace involvement.
-    const pane = process.env.HERDR_PANE_ID;
-    if (!pane) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
-    const worktree = job.worktree;
     try {
-      await fs.mkdir(path.dirname(worktree), { recursive: true });
-      await $`git -C ${job.repo} worktree add --quiet -b ${job.branch} ${worktree} ${job.baseCommit}`.quiet();
-      job.worktreeCreated = true;
-      job.branchCreated = true;
-      await this.save(job);
-      const { targetPane, direction } = await this.chooseSplitTarget(pane);
-      const splitJson = await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${worktree} --no-focus --env ${`${JOBDIR_ENV}=${jobDir(jobId)}`}`.text();
-      const newPane: string = JSON.parse(splitJson).result.pane.pane_id;
-      job.pane = newPane;
-      await this.save(job);
-
-      // pane run sends keystrokes: wait for shell/direnv startup before launching.
-      const cwdMarker = path.basename(worktree);
-      if (await exists(path.join(worktree, ".envrc"))) {
-        await $`direnv allow ${worktree}`.quiet().catch(() => {});
-      }
-      await this.waitForShellReady(newPane, cwdMarker);
-      // The full task stays in the handoff, never on the shell command line.
+      await this.place(job, false);
       const bootPrompt =
         `Call the \`read_task\` tool now to get your task, then carry it out in this worktree. ` +
-        `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`;
-      const safePrompt = `'${bootPrompt.replace(/'/g, `'\\''`)}'`;
-      const safeAgent = `'${input.agent.replace(/'/g, `'\\''`)}'`;
-      const launchCmd = `opencode --agent ${safeAgent} --auto --prompt ${safePrompt}`;
-      await $`herdr pane run ${newPane} ${launchCmd}`.quiet();
-      await $`herdr pane rename ${newPane} ${`${input.agent}-delegate`}`.quiet();
-
+        (job.mode === "interactive" ? `Work interactively with the user. Do not finish automatically; hand_back only on explicit user instruction.` :
+          `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`);
+      await this.launch(job, bootPrompt);
       job.phase = "running";
       job.createdAt = Date.now();
       await this.save(job);
       this.watchJob(jobId);
-      return { pane: newPane, worktree };
+      return { pane: job.pane!, worktree: job.worktree };
     } catch (error) {
+      if (job.mode === "interactive" && job.launchAttempted) {
+        await this.save(job);
+        this.watchJob(jobId);
+        throw new Error(`Launch may have started session ${jobId}; resources are preserved for inspection: ${error}`);
+      }
       try {
-        await this.reap(jobId, { deleteBranch: true });
+        await this.cleanup(jobId, { deleteBranch: true });
       } catch (cleanupError) {
         throw new Error(`Job ${jobId} failed to launch: ${error}. Cleanup failed and remains tracked; retry reap_delegate: ${cleanupError}`);
       }
       throw error;
     }
+  }
+
+  private async place(job: Job, reopen: boolean) {
+    const $ = this.$;
+    const caller = process.env.HERDR_PANE_ID;
+    if (!caller) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
+    if (job.placement === "subworkspace") {
+      if (!job.parentWorkspace) {
+        const source = JSON.parse(await $`herdr pane get ${caller}`.text()).result?.pane;
+        if (!source?.workspace_id) throw new Error("Cannot identify parent workspace");
+        job.parentWorkspace = source.workspace_id;
+        await this.save(job);
+      }
+      await $`herdr workspace get ${job.parentWorkspace!}`.quiet();
+      await fs.mkdir(path.dirname(job.worktree), { recursive: true });
+      job.resourceUncertain = true;
+      await this.save(job);
+      const response = reopen
+        ? await $`herdr worktree open --workspace ${job.parentWorkspace!} --path ${job.worktree} --no-focus --json`.text()
+        : await $`herdr worktree create --workspace ${job.parentWorkspace!} --branch ${job.branch} --base ${job.baseCommit} --path ${job.worktree} --label ${job.name ?? job.agent} --no-focus --json`.text();
+      const result = JSON.parse(response).result;
+      if (result?.worktree?.path !== job.worktree || !result.workspace?.workspace_id || !result.root_pane?.pane_id) throw new Error("Invalid herdr worktree response; inspect resources before retrying");
+      job.workspace = result.workspace.workspace_id;
+      job.pane = result.root_pane.pane_id;
+      job.worktreeCreated = true;
+      job.branchCreated = true;
+      job.resourceUncertain = false;
+      await this.save(job);
+      if (reopen && result.already_open) throw new Error("Workspace is already open without the saved pane. Inspect it rather than launching a duplicate session.");
+    } else {
+      if (!reopen) {
+        await fs.mkdir(path.dirname(job.worktree), { recursive: true });
+        await $`git -C ${job.repo} worktree add --quiet -b ${job.branch} ${job.worktree} ${job.baseCommit}`.quiet();
+        job.worktreeCreated = true;
+        job.branchCreated = true;
+        await this.save(job);
+      }
+      const { targetPane, direction } = await this.chooseSplitTarget(caller);
+      const response = JSON.parse(await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${job.worktree} --no-focus --env ${`${JOBDIR_ENV}=${this.dir(job.jobId)}`}`.text());
+      job.pane = response.result.pane.pane_id;
+      await this.save(job);
+    }
+  }
+
+  private async launch(job: Job, prompt: string, sessionID?: string) {
+    const $ = this.$;
+    if (await exists(path.join(job.worktree, ".envrc"))) await $`direnv allow ${job.worktree}`.quiet().catch(() => {});
+    await this.waitForShellReady(job.pane!, path.basename(job.worktree));
+    const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+    // Worktree-created workspaces cannot receive --env, so set it for the process.
+    const command = `env ${JOBDIR_ENV}=${quote(this.dir(job.jobId))} opencode --agent ${quote(job.agent)} --auto` +
+      (sessionID ? ` --session ${quote(sessionID)}` : "") + ` --prompt ${quote(prompt)}`;
+    job.launchAttempted = true;
+    await this.save(job);
+    await $`herdr pane run ${job.pane!} ${command}`.quiet();
+    await $`herdr pane rename ${job.pane!} ${job.name ?? `${job.agent}-delegate`}`.quiet();
   }
 
   // Wait until the pane's interactive shell has rendered its prompt (the cwd
@@ -554,6 +804,7 @@ export class Coordinator {
     this.watchers.clear();
     await Promise.all(this.scans.values());
     await Promise.all(this.cleanups.values());
+    await Promise.all(this.resumes.values());
   }
 }
 
@@ -568,6 +819,7 @@ export function delegateTool(coord: Coordinator) {
       task: z.string().describe("Complete task instructions (this is the ephemeral brief)."),
       repo: z.string().describe("Absolute path to the source repository."),
       branch: z.string().describe("Branch name for the delegate's worktree, e.g. delegate/foo."),
+      placement: z.enum(["pane", "subworkspace"]).default("pane").describe("Split a pane or open a child worktree workspace, as the user requested."),
       outputContract: z
         .enum(["advisory", "code-change"])
         .default("advisory")
@@ -598,6 +850,7 @@ export function delegateTool(coord: Coordinator) {
     async execute(args, context) {
       const { jobId } = await coord.createJob({
         sessionID: context.sessionID,
+        placement: args.placement,
         branch: args.branch,
         agent: args.agent,
         task: args.task,
@@ -635,11 +888,13 @@ export function reapTool(coord: Coordinator) {
     args: {
       jobId: z.string().describe("The job id (full or the 8-char short prefix shown in notes)."),
       deleteBranch: z.boolean().default(false).describe("Also delete the delegate branch."),
+      discard: z.boolean().default(false).describe("Destructive: only after user confirmation for an interactive discard request."),
+      confirmation: z.string().optional().describe("Exact full job ID, required to confirm destructive discard."),
     },
     async execute(args, context) {
       const jobId = coord.resolveJobId(args.jobId, context.sessionID);
       if (!jobId) return `No tracked job matching '${args.jobId}'.`;
-      await coord.reap(jobId, { deleteBranch: args.deleteBranch });
+      await coord.reap(jobId, { deleteBranch: args.deleteBranch, discard: args.discard, confirmation: args.confirmation });
       return `Reaped job ${jobId.slice(0, 8)}: pane closed, worktree and runtime state removed.`;
     },
   });
@@ -665,6 +920,41 @@ export function replyTool(coord: Coordinator) {
         return `Could not reply to job ${jobId.slice(0, 8)}: ${(e as Error).message}`;
       }
       return `Replied to job ${jobId.slice(0, 8)}; the delegate will unblock and continue.`;
+    },
+  });
+}
+
+export function openSessionTool(coord: Coordinator) {
+  return tool({
+    description: "Open a named interactive peer session for the user to steer. No automatic completion. Supports pane or subworkspace placement.",
+    args: {
+      agent: z.string(), name: z.string().min(1), task: z.string().min(1), repo: z.string(), branch: z.string(),
+      baseCommit: z.string().optional(), targetBranch: z.string().optional(),
+      placement: z.enum(["pane", "subworkspace"]).default("pane"),
+    },
+    async execute(args, context) {
+      const { jobId } = await coord.createJob({ ...args, mode: "interactive", sessionID: context.sessionID, outputContract: "code-change" });
+      const { pane, worktree } = await coord.spawnDelegate(jobId, { ...args, outputContract: "code-change" });
+      return `Opened interactive session ${args.name} (${jobId}) in ${args.placement ?? "pane"}, pane ${pane}.\nWorktree: ${worktree}\nThe user steers this session and explicitly pauses, hands back for commit, or requests discard.`;
+    },
+  });
+}
+
+export function listSessionsTool(coord: Coordinator) {
+  return tool({
+    description: "List this orchestrator's durable interactive sessions, including paused work. Never guess when several sessions match the user's request.",
+    args: {},
+    async execute(_args, context) { return coord.listSessions(context.sessionID); },
+  });
+}
+
+export function resumeSessionTool(coord: Coordinator) {
+  return tool({
+    description: "Resume a paused interactive session in its original placement, conversation, branch and worktree. Missing identities or resources fail explicitly.",
+    args: { jobId: z.string().optional(), instructions: z.string().optional() },
+    async execute(args, context) {
+      const jobId = await coord.resolveSession(context.sessionID, args.jobId);
+      return coord.resumeSession(jobId, args.instructions);
     },
   });
 }
