@@ -7,7 +7,7 @@ import { Coordinator, delegateTool, reapTool, replyTool } from "./coordinator.js
 import { DELEGATE_COMMAND_NAME, delegateCommand } from "./command.js";
 import { provisionSkill } from "./skill.js";
 
-export const PeerDelegate: Plugin = async ({ $, client }) => {
+export const PeerDelegate: Plugin = async ({ $, client, directory }) => {
   const delegateJobDir = process.env[JOBDIR_ENV];
 
   // ---- DELEGATE ROLE ----
@@ -30,15 +30,17 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
     // Mid-run heartbeat so the coordinator can tell "working" from "crashed".
     const stopHeartbeat = startHeartbeat(delegateJobDir);
     hooks.dispose = async () => stopHeartbeat();
-    // Task delivery is handled entirely at launch: the coordinator boots this
-    // delegate with `opencode --agent X --auto --prompt <task>`, which starts the
-    // first turn automatically. No in-process injection needed (a fresh TUI has
-    // no session to promptAsync into until a turn starts — verified in trial).
+    // Task delivery: the coordinator boots this delegate with a TINY launch
+    // prompt ("call read_task first") — see coordinator.spawnDelegate. The full
+    // task lives in the handoff already consumed above (state.task) and is served
+    // back via the `read_task` tool, keeping arbitrary task text off the command
+    // line entirely. No in-process prompt injection is needed.
     return hooks;
   }
 
   // ---- COORDINATOR ROLE ----
-  const coord = new Coordinator($, client);
+  const coord = new Coordinator($, client, directory);
+  await coord.recover();
 
   // Self-provision the coordinator skill (SKILL.md in the user's config dir).
   // Skills can't be injected via the config hook like commands, so we write the
@@ -61,18 +63,8 @@ export const PeerDelegate: Plugin = async ({ $, client }) => {
         cfg.command[DELEGATE_COMMAND_NAME] = delegateCommand;
       }
     },
-    // Learn (and keep fresh) the coordinator's own session id so the plugin can
-    // prompt ITSELF the moment a delegate reports (client.session.promptAsync,
-    // the discordance-proven inbound path). The watcher/timers notify directly —
-    // there is NO queue and NO idle-gated draining; a delegate result wakes the
-    // coordinator immediately, whether it is idle or mid-turn.
-    async event({ event }) {
-      if (event.type === "session.idle") {
-        coord.setSessionId(event.properties.sessionID);
-      }
-    },
     async dispose() {
-      coord.dispose();
+      await coord.dispose();
     },
   };
   return hooks;

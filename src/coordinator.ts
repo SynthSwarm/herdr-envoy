@@ -1,7 +1,6 @@
 // coordinator.ts — coordinator-role behavior (spec §2, §6, §12, §13).
-// Exposes a `delegate` tool; watches job-dirs via fs.watch and ENQUEUES events
-// (result/block) so the coordinator never blocks the user. Merge/verify land in
-// a later slice; this slice reproduces the cleared trial: spawn -> watch -> report.
+// Filesystem watches are wake hints. Persisted jobs are reconciled after restart
+// and periodically, so a missed watch event cannot lose a completion.
 import { promises as fs, watch, type FSWatcher } from "node:fs";
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
@@ -19,72 +18,132 @@ import {
   jobDir,
   rand,
   readJSON,
+  root,
   type Consumed,
   type Handoff,
   type Result,
 } from "./protocol.js";
+import { verify } from "./verify.js";
 
-// One coordinator per opencode process. Watches job-dirs and notifies the
-// coordinator agent DIRECTLY (client.session.promptAsync into its own session,
-// exactly like discordance's inbound path) the moment a delegate reports —
-// no internal queue, no idle-gating. The agent then drives verify/merge/reap.
+interface Job {
+  jobId: string;
+  directory: string;
+  coordinatorPane: string;
+  sessionID: string;
+  agent: string;
+  pane?: string;
+  worktree: string;
+  branch: string;
+  repo: string;
+  baseCommit: string;
+  createdAt: number;
+  startupTimeoutSeconds: number;
+  phase: "starting" | "running" | "cleanup";
+  worktreeCreated?: boolean;
+  branchCreated?: boolean;
+  deleteBranch?: boolean;
+  delivered: string[];
+  pending?: { key: string; messageID: string; text: string; attemptedAt?: number };
+  consumed?: Consumed;
+}
+
 export class Coordinator {
   private watchers = new Map<string, FSWatcher>();
-  private jobs = new Map<string, { agent: string; pane?: string; worktree: string; branch: string; repo: string; consumed?: Consumed; reaped?: boolean }>();
-  // The coordinator's own opencode session id, learned from session events. Used
-  // to prompt ITSELF via session.promptAsync so a delegate report immediately
-  // wakes the coordinator agent to react (works whether idle or mid-turn).
-  private sessionId: string | null = null;
+  private jobs = new Map<string, Job>();
+  private scans = new Map<string, Promise<void>>();
+  private cleanups = new Map<string, Promise<void>>();
+  private messageClock = 0n;
+  private disposed = false;
+  private reconcileTimer?: ReturnType<typeof setInterval>;
 
-  constructor(private $: Shell, private client: Client) {}
+  constructor(private $: Shell, private client: Client, private directory: string) {}
 
-  setSessionId(id: string) {
-    this.sessionId = id;
+  private async save(job: Job) {
+    // Auth stays in .consumed.json, not coordinator metadata.
+    const { consumed, ...metadata } = job;
+    await atomicWriteJSON(path.join(jobDir(job.jobId), FILES.coordinator), metadata);
   }
 
-  // Resolve the session to prompt: prefer the learned id; else fall back to the
-  // most-recently-updated session on this server (best-effort).
-  private async resolveSessionId(): Promise<string | null> {
-    if (this.sessionId) return this.sessionId;
-    try {
-      const res: any = await (this.client as any).session.list();
-      const arr = res?.data ?? res;
-      if (Array.isArray(arr) && arr.length) {
-        const sorted = [...arr].sort((a, b) => (b?.time?.updated ?? 0) - (a?.time?.updated ?? 0));
-        this.sessionId = sorted[0]?.id ?? null;
-        return this.sessionId;
-      }
-    } catch {
-      /* best-effort */
-    }
-    return null;
-  }
-
-  // Prompt the coordinator agent itself. Enqueues natively via promptAsync so it
-  // runs whether the coordinator is idle or busy (the discordance-proven path).
-  private async promptSelf(text: string): Promise<void> {
-    const id = await this.resolveSessionId();
-    if (!id) return;
-    try {
-      await (this.client as any).session.promptAsync({
-        path: { id },
-        body: { parts: [{ type: "text", text }] },
-      });
-    } catch {
-      // Last-ditch fallback: park it in the TUI prompt box.
+  async recover(): Promise<void> {
+    const entries = await fs.readdir(root(), { withFileTypes: true }).catch((error) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
+      const metadata = path.join(jobDir(entry.name), FILES.coordinator);
+      if (!(await exists(metadata))) continue; // Legacy jobs have no safe session owner.
       try {
-        await (this.client as any).tui.appendPrompt({ body: { text } });
-      } catch {
-        /* best-effort */
+        const job = await readJSON<Job>(metadata);
+        if (job.directory !== this.directory || job.coordinatorPane !== process.env.HERDR_PANE_ID) continue;
+        if (job.jobId !== entry.name || !job.sessionID || !Array.isArray(job.delivered)) {
+          throw new Error("invalid coordinator metadata");
+        }
+        this.jobs.set(job.jobId, job);
+        this.watchJob(job.jobId);
+      } catch (error) {
+        console.error(`herdr-envoy: cannot recover ${entry.name}:`, error);
       }
+    }
+    this.reconcileTimer ??= setInterval(() => {
+      for (const id of this.jobs.keys()) void this.reconcile(id);
+    }, 2000);
+    this.reconcileTimer.unref();
+  }
+
+  // A stable message ID lets read-back recover an accepted request whose response
+  // was lost. Never redirect to another session or an unsubmitted TUI prompt.
+  private async promptSelf(jobId: string, key: string, text: string): Promise<void> {
+    const job = this.jobs.get(jobId)!;
+    if (job.delivered.includes(key)) return;
+    if (!job.pending) {
+      job.pending = { key, text, messageID: this.messageID() };
+      await this.save(job);
+    }
+    const pending = job.pending;
+    const request = { path: { id: job.sessionID, messageID: pending.messageID } };
+    let receipt = await this.client.session.message({ ...request, signal: AbortSignal.timeout(15_000) });
+    if (receipt.error && receipt.response.status !== 404) throw new Error(`message read-back failed: ${receipt.response.status}`);
+    if (!receipt.data) {
+      if (pending.attemptedAt && Date.now() - pending.attemptedAt < 10_000) return;
+      const status = await this.client.session.status({ throwOnError: true, signal: AbortSignal.timeout(15_000) });
+      if (status.data?.[job.sessionID]?.type !== undefined && status.data[job.sessionID].type !== "idle") return;
+      // Deferred notifications must sort after the turn that just finished.
+      if (!pending.attemptedAt) pending.messageID = this.messageID();
+      request.path.messageID = pending.messageID;
+      pending.attemptedAt = Date.now();
+      await this.save(job);
+      await this.client.session.promptAsync({
+        path: { id: job.sessionID },
+        body: { messageID: pending.messageID, parts: [{ type: "text", text: pending.text }] },
+        throwOnError: true,
+        signal: AbortSignal.timeout(15_000),
+      });
+      receipt = await this.client.session.message({ ...request, signal: AbortSignal.timeout(15_000) });
+    }
+    if (!receipt.data?.parts.some((part) => part.type === "text" && part.text === pending.text)) return;
+    job.delivered.push(pending.key);
+    job.pending = undefined;
+    try {
+      await this.save(job);
+    } catch (error) {
+      job.delivered.pop();
+      job.pending = pending;
+      throw error;
     }
   }
 
+  private messageID(): string {
+    // OpenCode 1.18 IDs pack milliseconds and a counter into six bytes.
+    // https://github.com/anomalyco/opencode/blob/v1.18.4/packages/opencode/src/id/id.ts
+    // Match its ordering so injected messages do not outrank all future prompts.
+    const now = BigInt(Date.now()) * 0x1000n;
+    this.messageClock = now > this.messageClock ? now : this.messageClock + 1n;
+    return `msg_${(this.messageClock & 0xffffffffffffn).toString(16).padStart(12, "0")}${rand().slice(0, 14)}`;
+  }
 
-  // A delegate published result.json. Notify the coordinator agent DIRECTLY with
-  // the full report + context and let IT drive verify/merge/reap/re-prompt. The
-  // plugin does NOT auto-verify/merge/reap and does NOT delete result.json or the
-  // pane/worktree — the agent decides. Fired immediately by the fs.watcher.
+
+  // Validate the report before delivery. Merging and cleanup remain explicit.
   async notifyResult(jobId: string, r: Result): Promise<void> {
     const short = jobId.slice(0, 8);
     const job = this.jobs.get(jobId);
@@ -96,6 +155,16 @@ export class Coordinator {
       /* toast best-effort */
     }
 
+    if (!consumed) throw new Error("result arrived without consumed handoff");
+    const validation = await verify(this.$, r, consumed, job?.worktree);
+    if (!validation.ok) {
+      await this.promptSelf(jobId, "result", `[peer-delegate] Job ${short}: report REJECTED (${validation.reason}). No merge performed. Inspect the job before cleanup.`);
+      return;
+    }
+    if (r.outputContract === "code-change" && r.status === "success" && (r.branch !== job?.branch || r.baseCommit !== job?.baseCommit)) {
+      await this.promptSelf(jobId, "result", `[peer-delegate] Job ${short}: report REJECTED (assigned branch/base mismatch). No merge performed.`);
+      return;
+    }
     const lines: string[] = [];
     lines.push(`[peer-delegate] Delegate job ${short} reported: ${r.status} (${r.outputContract}).`);
     lines.push(`Summary: ${r.summary}`);
@@ -113,17 +182,17 @@ export class Coordinator {
       lines.push(`Delegate pane ${job.pane ?? "?"} is still OPEN; worktree: ${job.worktree}.`);
     }
     lines.push(
-      `Decide what to do: review the deliverable; for code-change verify the commit(s) and merge ` +
-        `into the target if appropriate; then either \`reap_delegate\` (jobId ${short}) to close the ` +
-        `pane + worktree, or push more instructions to the delegate via \`herdr pane run ${job?.pane ?? "<pane>"} ...\`. ` +
+        `No merge or cleanup has been performed. Review the deliverable and run the required checks. ` +
+         `Obtain user approval before merging code changes, then use \`reap_delegate\` (jobId ${short}) ` +
+         `when the checkout is clean and no longer needed. Completion is terminal; use a new job for follow-up work. ` +
         `Report the outcome to the user.`,
     );
-    await this.promptSelf(lines.join("\n"));
+    await this.promptSelf(jobId, "result", lines.join("\n"));
   }
 
   // A delegate is blocked awaiting an answer (block.json present). Notify the
   // coordinator agent to answer via reply_delegate. Fired by the fs.watcher.
-  async notifyBlock(jobId: string): Promise<void> {
+  async notifyBlock(jobId: string, key: string): Promise<void> {
     const short = jobId.slice(0, 8);
     let question = "";
     try {
@@ -137,7 +206,7 @@ export class Coordinator {
     } catch {
       /* toast best-effort */
     }
-    await this.promptSelf(
+    await this.promptSelf(jobId, key,
       `[peer-delegate] Delegate job ${short} is BLOCKED and asks:\n"${question}"\n` +
         `Answer it with the \`reply_delegate\` tool (jobId ${short}) to unblock it.`,
     );
@@ -152,7 +221,7 @@ export class Coordinator {
     } catch {
       /* toast best-effort */
     }
-    await this.promptSelf(
+    await this.promptSelf(jobId, "stalled",
       `[peer-delegate] Delegate job ${short} appears STALLED — no heartbeat for >30s and no result ` +
         `(it may have crashed or hung). Read its pane (${job?.pane ?? "?"}); \`reap_delegate\` (jobId ${short}) ` +
         `to clean up, or push a nudge via \`herdr pane run ${job?.pane ?? "<pane>"} ...\`.`,
@@ -168,7 +237,7 @@ export class Coordinator {
     } catch {
       /* toast best-effort */
     }
-    await this.promptSelf(
+    await this.promptSelf(jobId, "startup-timeout",
       `[peer-delegate] Delegate job ${short} failed to start within its timeout. Read its pane ` +
         `(${job?.pane ?? "?"}); \`reap_delegate\` (jobId ${short}) to clean up and optionally re-delegate.`,
     );
@@ -176,12 +245,10 @@ export class Coordinator {
 
 
   // Resolve a full jobId from a full id or its 8-char short prefix.
-  resolveJobId(idOrPrefix: string): string | undefined {
-    if (this.jobs.has(idOrPrefix)) return idOrPrefix;
-    for (const id of this.jobs.keys()) {
-      if (id.startsWith(idOrPrefix)) return id;
-    }
-    return undefined;
+  resolveJobId(idOrPrefix: string, sessionID?: string): string | undefined {
+    const matches = [...this.jobs.keys()].filter((id) =>
+      idOrPrefix.length >= 8 && id.startsWith(idOrPrefix) && (!sessionID || this.jobs.get(id)?.sessionID === sessionID));
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   private async loadConsumed(jobId: string): Promise<Consumed | null> {
@@ -208,165 +275,104 @@ export class Coordinator {
     });
   }
 
-  // Reap a finished job: close the delegate pane, remove the git worktree, and
-  // clear all in-memory state + the job-dir. No herdr worktree/workspace calls —
-  // the checkout is a plain `git worktree` we own. Idempotent; best-effort per
-  // step so one failure doesn't strand the rest.
+  // Persist each successful cleanup step. Stop on failure and retain the job.
   async reap(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean } = {}): Promise<void> {
+    const running = this.cleanups.get(jobId);
+    if (running) return running;
+    const cleanup = this.cleanup(jobId, opts).finally(() => this.cleanups.delete(jobId));
+    this.cleanups.set(jobId, cleanup);
+    return cleanup;
+  }
+
+  private async cleanup(jobId: string, opts: { deleteBranch?: boolean; keepPane?: boolean }): Promise<void> {
     const $ = this.$;
     const job = this.jobs.get(jobId);
-
-    // stop watching + cancel any startup timer first
-    const w = this.watchers.get(jobId);
-    if (w) {
-      w.close();
-      this.watchers.delete(jobId);
-    }
-    const t = this.startupTimers.get(jobId);
-    if (t) {
-      clearTimeout(t);
-      this.startupTimers.delete(jobId);
-    }
-    const lv = this.livenessTimers.get(jobId);
-    if (lv) {
-      clearInterval(lv);
-      this.livenessTimers.delete(jobId);
-    }
-    this.stalledFired.delete(jobId);
-    this.seen.delete(jobId);
-
-    if (job && !job.reaped) {
-      job.reaped = true;
-      // 1. close the delegate pane (unless caller wants it kept for inspection)
-      if (job.pane && !opts.keepPane) {
-        await $`herdr pane close ${job.pane}`.quiet().catch(() => {});
+    if (!job) return;
+    if (opts.keepPane) throw new Error("Cannot remove a checkout while retaining its delegate pane");
+    job.phase = "cleanup";
+    job.deleteBranch ||= opts.deleteBranch;
+    await this.scans.get(jobId);
+    await this.save(job);
+    if (job.pane) {
+      const panes = JSON.parse(await $`herdr pane list`.text()).result?.panes;
+      if (!Array.isArray(panes)) throw new Error("Cannot establish whether delegate pane exists");
+      if (panes.some((pane: { pane_id: string }) => pane.pane_id === job.pane)) {
+        await $`herdr pane close ${job.pane}`.quiet();
       }
-      // 2. remove the git worktree we created, then prune
-      await $`git -C ${job.repo} worktree remove --force ${job.worktree}`.quiet().catch(() => {});
-      await $`git -C ${job.repo} worktree prune`.quiet().catch(() => {});
-      // 3. optionally delete the delegate branch (only if merged/no longer needed)
-      if (opts.deleteBranch && job.branch) {
-        await $`git -C ${job.repo} branch -D ${job.branch}`.quiet().catch(() => {});
-      }
+      job.pane = undefined;
+      await this.save(job);
     }
-
-    // 4. clear the job-dir (all transport files) and forget the job
-    await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {});
+    if (job.worktreeCreated) {
+      // No --force: uncommitted or untracked work must survive cleanup.
+      if (await exists(job.worktree)) await $`git -C ${job.repo} worktree remove ${job.worktree}`.quiet();
+      await $`git -C ${job.repo} worktree prune`.quiet();
+      job.worktreeCreated = false;
+      await this.save(job);
+    }
+    if (job.deleteBranch && job.branchCreated) {
+      const branches = (await $`git -C ${job.repo} for-each-ref --format=%(refname) refs/heads/`.text()).split("\n");
+      if (branches.includes(`refs/heads/${job.branch}`)) await $`git -C ${job.repo} branch -d ${job.branch}`.quiet();
+      job.branchCreated = false;
+      await this.save(job);
+    }
+    await fs.rm(jobDir(jobId), { recursive: true, force: true });
+    this.watchers.get(jobId)?.close();
+    this.watchers.delete(jobId);
     this.jobs.delete(jobId);
   }
 
-  // Startup-timeout: if the delegate hasn't consumed the handoff (.consumed.json
-  // present) within N seconds, treat as failed-to-start — stop the process,
-  // enqueue an event, leave the pane open for inspection (spec §3).
-  private startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-  private armStartupTimeout(jobId: string, pane: string, seconds: number) {
-    const t = setTimeout(async () => {
-      this.startupTimers.delete(jobId);
-      const consumedPath = path.join(jobDir(jobId), FILES.consumed);
-      if (await exists(consumedPath)) return; // booted fine
-      void this.notifyStartupTimeout(jobId);
-      try {
-        // interrupt the pane's foreground process; leave the pane open.
-        await this.$`herdr pane send-keys ${pane} C-c`.quiet();
-      } catch {
-        /* best-effort */
-      }
-    }, seconds * 1000);
-    this.startupTimers.set(jobId, t);
-  }
-
-  // Mid-run liveness: after boot, poll the heartbeat file. If it goes stale past
-  // `stallSeconds` (delegate crashed/hung) with no result yet, fire `stalled`
-  // once (spec §13 — distinguish working from crashed). Leaves pane open.
-  private livenessTimers = new Map<string, ReturnType<typeof setInterval>>();
-  private stalledFired = new Set<string>();
-
-  private armLiveness(jobId: string, stallSeconds = 30, pollMs = 10_000) {
-    const timer = setInterval(async () => {
-      const dir = jobDir(jobId);
-      // not booted yet, or already finished/reaped → nothing to monitor
-      if (!(await exists(path.join(dir, FILES.consumed)))) return;
-      if (await exists(path.join(dir, FILES.result))) return;
-      if (this.stalledFired.has(jobId)) return;
-      const hb = path.join(dir, FILES.heartbeat);
-      let ageMs = Infinity;
-      try {
-        const st = await stat(hb);
-        ageMs = Date.now() - st.mtimeMs;
-      } catch {
-        // no heartbeat file yet: fall back to time since consume via .consumed mtime
-        try {
-          const st = await stat(path.join(dir, FILES.consumed));
-          ageMs = Date.now() - st.mtimeMs;
-        } catch {
-          return;
-        }
-      }
-      if (ageMs > stallSeconds * 1000) {
-        this.stalledFired.add(jobId);
-        void this.notifyStalled(jobId);
-      }
-    }, pollMs);
-    (timer as any).unref?.();
-    this.livenessTimers.set(jobId, timer);
-  }
-
-  // Watch a job-dir. NOTE: atomic temp+rename makes fs.watch report the TEMP
-  // filename on the rename, not the canonical name — so we ignore the reported
-  // filename and re-scan the dir for canonical files on every event (debounced).
-  private seen = new Map<string, Set<string>>();
-
+  // Watch events only accelerate the periodic scan, including atomic renames.
   private watchJob(jobId: string) {
     if (this.watchers.has(jobId)) return;
-    const dir = jobDir(jobId);
-    this.seen.set(jobId, new Set());
-    let pendingScan = false;
-    const scan = async () => {
-      if (pendingScan) return;
-      pendingScan = true;
-      await new Promise((r) => setTimeout(r, 50)); // debounce/settle
-      pendingScan = false;
-      const seen = this.seen.get(jobId)!;
+    try {
+      const watcher = watch(jobDir(jobId), () => void this.reconcile(jobId));
+      watcher.on("error", (error) => {
+        console.error(`herdr-envoy: watch failed for ${jobId}:`, error);
+        watcher.close();
+        this.watchers.delete(jobId);
+      });
+      this.watchers.set(jobId, watcher);
+    } catch (error) {
+      console.error(`herdr-envoy: watch unavailable for ${jobId}, using reconciliation:`, error);
+    }
+    void this.reconcile(jobId);
+  }
 
-      // consumed → cancel startup timeout (once)
-      if (!seen.has("consumed") && (await exists(path.join(dir, FILES.consumed)))) {
-        seen.add("consumed");
-        const t = this.startupTimers.get(jobId);
-        if (t) {
-          clearTimeout(t);
-          this.startupTimers.delete(jobId);
-        }
+  async reconcile(jobId: string): Promise<void> {
+    if (this.disposed) return;
+    const existing = this.scans.get(jobId);
+    if (existing) return existing;
+    const scan = (async () => {
+      const job = this.jobs.get(jobId);
+      if (!job || job.phase === "cleanup") return;
+      if (job.pending) {
+        await this.promptSelf(jobId, job.pending.key, job.pending.text);
+        if (job.pending) return;
       }
-      // result → notify coordinator directly (once)
-      if (!seen.has("result") && (await exists(path.join(dir, FILES.result)))) {
-        seen.add("result");
-        // job finished — stop the liveness monitor
-        const lv = this.livenessTimers.get(jobId);
-        if (lv) {
-          clearInterval(lv);
-          this.livenessTimers.delete(jobId);
-        }
-        try {
-          const payload = await readJSON<Result>(path.join(dir, FILES.result));
-          void this.notifyResult(jobId, payload);
-        } catch {
-          seen.delete("result"); // partial; retry on next event
-        }
+      const dir = jobDir(jobId);
+      if (await exists(path.join(dir, FILES.result))) {
+        if (!job.delivered.includes("result")) await this.notifyResult(jobId, await readJSON<Result>(path.join(dir, FILES.result)));
+        return;
       }
-      // block → notify each time a new block appears (delegate removes it on reply)
       if (await exists(path.join(dir, FILES.block))) {
-        if (!seen.has("block")) {
-          seen.add("block");
-          void this.notifyBlock(jobId);
-        }
-      } else {
-        seen.delete("block"); // block consumed; allow the next one
+        const block = await readJSON<import("./protocol.js").Block>(path.join(dir, FILES.block));
+        const consumed = await this.loadConsumed(jobId);
+        if (!consumed || block.jobId !== jobId || block.generation !== consumed.generation || block.completionToken !== consumed.completionToken) throw new Error("invalid block identity");
+        const key = `block:${block.at}`;
+        if (!job.delivered.includes(key)) await this.notifyBlock(jobId, key);
+        return;
       }
-    };
-    const w = watch(dir, () => void scan());
-    this.watchers.set(jobId, w);
-    void scan(); // initial scan in case files already exist
+      if (!(await exists(path.join(dir, FILES.consumed)))) {
+        if (Date.now() - job.createdAt > job.startupTimeoutSeconds * 1000 && !job.delivered.includes("startup-timeout")) await this.notifyStartupTimeout(jobId);
+        return;
+      }
+      const heartbeat = await stat(path.join(dir, FILES.heartbeat)).catch(() => stat(path.join(dir, FILES.consumed)));
+      if (Date.now() - heartbeat.mtimeMs > 30_000 && !job.delivered.includes("stalled")) await this.notifyStalled(jobId);
+    })().catch((error) => {
+      console.error(`herdr-envoy: reconciliation failed for ${jobId}, will retry:`, error);
+    }).finally(() => this.scans.delete(jobId));
+    this.scans.set(jobId, scan);
+    return scan;
   }
 
   async createJob(input: {
@@ -379,7 +385,17 @@ export class Coordinator {
     mergePolicy?: "manual" | "auto-after-checks";
     checks?: { command: string; expectedExitCode: number }[];
     startupTimeoutSeconds?: number;
+    sessionID: string;
+    branch: string;
   }): Promise<{ jobId: string; jobDir: string }> {
+    if (input.mergePolicy === "auto-after-checks") throw new Error("auto-after-checks is not implemented. Use manual and review/check the result before merging.");
+    if (!process.env.HERDR_PANE_ID) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
+    if (!input.sessionID || !path.isAbsolute(input.repo)) throw new Error("A session owner and absolute repo path are required");
+    await this.assertAgentExists(input.agent, input.repo);
+    await this.$`git -C ${input.repo} check-ref-format --branch ${input.branch}`.quiet();
+    const branchExists = await this.$`git -C ${input.repo} show-ref --verify --quiet ${`refs/heads/${input.branch}`}`.then(() => true).catch(() => false);
+    if (branchExists) throw new Error(`Branch already exists: ${input.branch}. Use a fresh branch.`);
+    const baseCommit = (await this.$`git -C ${input.repo} rev-parse --verify --end-of-options ${`${input.baseCommit ?? "HEAD"}^{commit}`}`.text()).trim();
     const jobId = rand();
     const dir = jobDir(jobId);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -394,12 +410,21 @@ export class Coordinator {
       task: input.task,
       outputContract: input.outputContract,
       targetBranch: input.targetBranch ?? "",
-      baseCommit: input.baseCommit ?? "",
-      mergePolicy: input.mergePolicy ?? "auto-after-checks",
+      baseCommit,
+      mergePolicy: "manual",
       checks: input.checks ?? [],
       startupTimeoutSeconds: input.startupTimeoutSeconds ?? 30,
     };
     await atomicWriteJSON(path.join(dir, FILES.handoff), handoff);
+    const job: Job = {
+      jobId, directory: this.directory, coordinatorPane: process.env.HERDR_PANE_ID, sessionID: input.sessionID,
+      agent: input.agent, repo: input.repo, branch: input.branch, baseCommit,
+      worktree: path.join(input.repo, ".herdr-envoy", "worktrees", jobId),
+      createdAt: Date.now(), startupTimeoutSeconds: handoff.startupTimeoutSeconds,
+      phase: "starting", delivered: [],
+    };
+    await this.save(job);
+    this.jobs.set(jobId, job);
     return { jobId, jobDir: dir };
   }
 
@@ -446,8 +471,6 @@ export class Coordinator {
           bestArea = area;
         }
       }
-      // Terminal cells are ~2x taller than wide; weight width so a "square-looking"
-      // pane in cells is actually wider on screen and splits into columns.
       const direction: "right" | "down" = best.rect.width >= best.rect.height ? "right" : "down";
       return { targetPane: best.pane_id, direction };
     } catch {
@@ -459,76 +482,56 @@ export class Coordinator {
   // with JOBDIR_ENV set so its plugin activates the delegate role.
   async spawnDelegate(jobId: string, input: { agent: string; repo: string; branch: string; task: string; outputContract: "advisory" | "code-change"; startupTimeoutSeconds?: number }): Promise<{ pane: string; worktree: string }> {
     const $ = this.$;
-    // Fail fast if the agent doesn't exist (before any worktree/pane creation).
-    await this.assertAgentExists(input.agent, input.repo);
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error(`Unknown job ${jobId}`);
     // Plain `git worktree add` — NOT `herdr worktree create` (which spins up an
     // orphan herdr workspace we'd have to clean up separately). We manage the
     // checkout ourselves under <repo>/.herdr-envoy/worktrees and split into the
     // CURRENT herdr workspace. No herdr worktree/workspace involvement.
-    const wtRoot = `${input.repo}/.herdr-envoy/worktrees`;
-    const worktree = `${wtRoot}/${input.branch.replace(/\//g, "-")}`;
-    await $`mkdir -p ${wtRoot}`.quiet();
-    const wtList = await $`git -C ${input.repo} worktree list --porcelain`.text();
-    if (!wtList.includes(worktree)) {
-      const branchExists = await $`git -C ${input.repo} rev-parse --verify --quiet ${`refs/heads/${input.branch}`}`
-        .then(() => true)
-        .catch(() => false);
-      if (branchExists) {
-        await $`git -C ${input.repo} worktree add --quiet ${worktree} ${input.branch}`.quiet();
-      } else {
-        await $`git -C ${input.repo} worktree add --quiet -b ${input.branch} ${worktree}`.quiet();
-      }
-    }
-
     const pane = process.env.HERDR_PANE_ID;
     if (!pane) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
-    // Balance the workspace: instead of always halving the CURRENT pane (which
-    // shrinks every subsequent delegate), analyze the layout, pick the pane with
-    // the most screen area, and split it along its LONGER axis (wide -> right,
-    // tall -> down). This spreads delegates evenly across the workspace.
-    const { targetPane, direction } = await this.chooseSplitTarget(pane);
-    const splitJson = await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${worktree} --no-focus --env ${`${JOBDIR_ENV}=${jobDir(jobId)}`}`.text();
-    const newPane: string = JSON.parse(splitJson).result.pane.pane_id;
+    const worktree = job.worktree;
+    try {
+      await fs.mkdir(path.dirname(worktree), { recursive: true });
+      await $`git -C ${job.repo} worktree add --quiet -b ${job.branch} ${worktree} ${job.baseCommit}`.quiet();
+      job.worktreeCreated = true;
+      job.branchCreated = true;
+      await this.save(job);
+      const { targetPane, direction } = await this.chooseSplitTarget(pane);
+      const splitJson = await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${worktree} --no-focus --env ${`${JOBDIR_ENV}=${jobDir(jobId)}`}`.text();
+      const newPane: string = JSON.parse(splitJson).result.pane.pane_id;
+      job.pane = newPane;
+      await this.save(job);
 
-    // Boot race (learned in trial): `pane run` blasts the command as keystrokes.
-    // If the interactive shell (zsh + direnv hook) hasn't finished initializing,
-    // the command gets mangled/echoed and opencode never launches ("agent never
-    // starts"). A fixed sleep is unreliable — direnv timing varies. Instead wait
-    // for the shell prompt to actually render (the cwd basename shows in the
-    // prompt) before running anything.
-    const cwdMarker = path.basename(worktree);
-    // If the worktree carries a .envrc, authorize it FIRST so the shell's direnv
-    // hook loads (not prompts) and settles before we launch opencode.
-    if (await exists(path.join(worktree, ".envrc"))) {
-      await $`direnv allow ${worktree}`.quiet().catch(() => {});
+      // pane run sends keystrokes: wait for shell/direnv startup before launching.
+      const cwdMarker = path.basename(worktree);
+      if (await exists(path.join(worktree, ".envrc"))) {
+        await $`direnv allow ${worktree}`.quiet().catch(() => {});
+      }
+      await this.waitForShellReady(newPane, cwdMarker);
+      // The full task stays in the handoff, never on the shell command line.
+      const bootPrompt =
+        `Call the \`read_task\` tool now to get your task, then carry it out in this worktree. ` +
+        `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`;
+      const safePrompt = `'${bootPrompt.replace(/'/g, `'\\''`)}'`;
+      const safeAgent = `'${input.agent.replace(/'/g, `'\\''`)}'`;
+      const launchCmd = `opencode --agent ${safeAgent} --auto --prompt ${safePrompt}`;
+      await $`herdr pane run ${newPane} ${launchCmd}`.quiet();
+      await $`herdr pane rename ${newPane} ${`${input.agent}-delegate`}`.quiet();
+
+      job.phase = "running";
+      job.createdAt = Date.now();
+      await this.save(job);
+      this.watchJob(jobId);
+      return { pane: newPane, worktree };
+    } catch (error) {
+      try {
+        await this.reap(jobId, { deleteBranch: true });
+      } catch (cleanupError) {
+        throw new Error(`Job ${jobId} failed to launch: ${error}. Cleanup failed and remains tracked; retry reap_delegate: ${cleanupError}`);
+      }
+      throw error;
     }
-    await this.waitForShellReady(newPane, cwdMarker);
-    // Task delivery rides in on the launch command, but we keep the launch prompt
-    // TINY: the full task (which can be huge) lives in the handoff the delegate
-    // already consumed on boot, and the delegate exposes a `read_task` tool. So we
-    // only tell the agent to call read_task first. This keeps arbitrary task text
-    // (quotes, newlines, length) off the shell command line entirely.
-    // --auto: delegates are trusted same-user peers; auto-approve permissions so
-    // the agent can write to its worktree + the job-dir without a blocking prompt
-    // (finding §11a.6). direnv + shell readiness are already handled above, so the
-    // coordinator's task never needs shell/startup boilerplate.
-    const bootPrompt =
-      `Call the \`read_task\` tool now to get your task, then carry it out in this worktree. ` +
-      `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`;
-    // `herdr pane run` executes the string in the pane's shell, so the whole
-    // opencode invocation must be ONE shell-safe command. Single-quote the prompt
-    // and escape any embedded single-quotes ('\'').
-    const safePrompt = `'${bootPrompt.replace(/'/g, `'\\''`)}'`;
-    const launchCmd = `opencode --agent ${input.agent} --auto --prompt ${safePrompt}`;
-    await $`herdr pane run ${newPane} ${launchCmd}`.quiet();
-    await $`herdr pane rename ${newPane} ${`${input.agent}-delegate`}`.quiet();
-
-    this.jobs.set(jobId, { agent: input.agent, pane: newPane, worktree, branch: input.branch, repo: input.repo });
-    this.watchJob(jobId);
-    this.armStartupTimeout(jobId, newPane, input.startupTimeoutSeconds ?? 30);
-    this.armLiveness(jobId);
-
-    return { pane: newPane, worktree };
   }
 
   // Wait until the pane's interactive shell has rendered its prompt (the cwd
@@ -544,13 +547,13 @@ export class Coordinator {
     }
   }
 
-  dispose() {
+  async dispose() {
+    this.disposed = true;
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     for (const w of this.watchers.values()) w.close();
     this.watchers.clear();
-    for (const t of this.startupTimers.values()) clearTimeout(t);
-    this.startupTimers.clear();
-    for (const lv of this.livenessTimers.values()) clearInterval(lv);
-    this.livenessTimers.clear();
+    await Promise.all(this.scans.values());
+    await Promise.all(this.cleanups.values());
   }
 }
 
@@ -565,14 +568,37 @@ export function delegateTool(coord: Coordinator) {
       task: z.string().describe("Complete task instructions (this is the ephemeral brief)."),
       repo: z.string().describe("Absolute path to the source repository."),
       branch: z.string().describe("Branch name for the delegate's worktree, e.g. delegate/foo."),
-      outputContract: z.enum(["advisory", "code-change"]).default("advisory"),
-      targetBranch: z.string().optional(),
-      baseCommit: z.string().optional(),
-      mergePolicy: z.enum(["manual", "auto-after-checks"]).optional(),
-      startupTimeoutSeconds: z.number().optional(),
+      outputContract: z
+        .enum(["advisory", "code-change"])
+        .default("advisory")
+        .describe(
+          "advisory = analysis/answer only, delegate makes NO commits; code-change = delegate commits to its branch."
+        ),
+      targetBranch: z
+        .string()
+        .optional()
+        .describe("code-change only: the branch the delegate's result should merge into."),
+      baseCommit: z
+        .string()
+        .optional()
+        .describe("code-change only: the commit the delegate's worktree/branch is based on."),
+      mergePolicy: z
+        .enum(["manual", "auto-after-checks"])
+        .optional()
+        .describe(
+          "Only manual is supported. auto-after-checks is rejected until automatic merging is implemented."
+        ),
+      startupTimeoutSeconds: z
+        .number()
+        .positive()
+        .finite()
+        .optional()
+        .describe("Seconds to wait for the delegate to boot before marking the job stalled."),
     },
-    async execute(args) {
+    async execute(args, context) {
       const { jobId } = await coord.createJob({
+        sessionID: context.sessionID,
+        branch: args.branch,
         agent: args.agent,
         task: args.task,
         repo: args.repo,
@@ -580,6 +606,7 @@ export function delegateTool(coord: Coordinator) {
         targetBranch: args.targetBranch,
         baseCommit: args.baseCommit,
         mergePolicy: args.mergePolicy,
+        startupTimeoutSeconds: args.startupTimeoutSeconds,
       });
       const { pane, worktree } = await coord.spawnDelegate(jobId, {
         agent: args.agent,
@@ -603,17 +630,17 @@ export function delegateTool(coord: Coordinator) {
 export function reapTool(coord: Coordinator) {
   return tool({
     description:
-      "Clean up a delegate job: close its pane, remove its git worktree + the orphan herdr " +
-      "workspace, and clear its job-dir. Use for jobs that were kept for inspection.",
+       "Clean up a delegate job: close its pane, remove its clean git worktree and clear its job-dir. " +
+       "Dirty worktrees are preserved. Failed cleanup remains tracked for retry.",
     args: {
       jobId: z.string().describe("The job id (full or the 8-char short prefix shown in notes)."),
       deleteBranch: z.boolean().default(false).describe("Also delete the delegate branch."),
     },
-    async execute(args) {
-      const jobId = coord.resolveJobId(args.jobId);
+    async execute(args, context) {
+      const jobId = coord.resolveJobId(args.jobId, context.sessionID);
       if (!jobId) return `No tracked job matching '${args.jobId}'.`;
       await coord.reap(jobId, { deleteBranch: args.deleteBranch });
-      return `Reaped job ${jobId.slice(0, 8)}: pane closed, worktree + workspace removed.`;
+      return `Reaped job ${jobId.slice(0, 8)}: pane closed, worktree and runtime state removed.`;
     },
   });
 }
@@ -629,8 +656,8 @@ export function replyTool(coord: Coordinator) {
       jobId: z.string().describe("The job id (full or the 8-char short prefix shown in the block note)."),
       answer: z.string().describe("Your answer to the delegate's question."),
     },
-    async execute(args) {
-      const jobId = coord.resolveJobId(args.jobId);
+    async execute(args, context) {
+      const jobId = coord.resolveJobId(args.jobId, context.sessionID);
       if (!jobId) return `No tracked job matching '${args.jobId}'.`;
       try {
         await coord.reply(jobId, args.answer);

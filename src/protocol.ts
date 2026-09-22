@@ -130,6 +130,7 @@ export async function exists(file: string): Promise<boolean> {
 export const FILES = {
   handoff: "handoff.json",
   consumed: ".consumed.json",
+  coordinator: "coordinator.json",
   result: "result.json",
   block: "block.json",
   reply: "reply.json",

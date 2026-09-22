@@ -3,11 +3,12 @@
 An [opencode](https://opencode.ai) plugin that lets a **coordinator** session delegate
 bounded tasks to **real peer opencode agents**, each running in its own **git worktree**,
 spawned as a split pane in the current [herdr](https://herdr.dev) workspace. The coordinator
-monitors them asynchronously, then auto-verifies and (optionally) auto-merges their work.
+monitors them asynchronously and validates their reports. **It does not automatically merge
+or reap completed jobs.** Code changes require review, checks and user approval before merging.
 
 Unlike a subagent, each delegate is a genuine separate agent process with its own context
-window and its own branch — so parallel delegates never clobber each other, sessions survive
-and can be attached, and you can interject mid-flight.
+window and its own branch. Separate checkouts isolate file edits, and you can inspect each
+delegate's pane or interject mid-flight. Restart recovery has explicit ownership limits below.
 
 > **Agents are yours.** This package ships only the delegation *tooling*. You choose which of
 > your own opencode agents to delegate to (by name). Nothing installs or overrides your agents.
@@ -31,8 +32,8 @@ Add it to your opencode config `plugin` array:
 }
 ```
 
-opencode installs npm plugins automatically at startup. That's it — no agent or skill files
-are added to your config.
+opencode installs npm plugins automatically at startup. No agents are installed. The plugin
+provisions the coordinator skill described below if it is missing.
 
 ## What you get
 
@@ -42,34 +43,52 @@ coordinator guidance so a fresh install knows *how and when* to delegate — wit
 - **`/envoy` command** — injected into your config on load (via the plugin's `config` hook). Type
   `/envoy <what to delegate>` in the TUI to kick off a delegation. Won't override an `envoy`
   command you already defined.
-- **`envoy` skill** — self-provisioned to `~/.config/opencode/skills/envoy/SKILL.md`
-  on first load (idempotent; never overwrites your edits). Lets the coordinator agent *proactively*
-  recognize delegable work and load the how/when guidance on demand.
+- **`envoy` skill** — provisioned to `$XDG_CONFIG_HOME/opencode/skills/envoy/SKILL.md`
+  (default `~/.config/opencode/skills/envoy/SKILL.md`) only if missing. Existing installed skills
+  are not overwritten and need **manual review/update** when the shipped guidance changes.
+  It lets the coordinator recognise delegable work and load guidance on demand.
 
 Both are guidance only — **no agents are installed or overridden.** You still choose which of your
 own agents each delegate runs as.
 
+After installing/updating the plugin or manually updating an installed skill, quit and restart
+opencode to load the changes.
+
 ### Coordinator tools (in your normal sessions)
 
-- **`delegate`** — spawn a peer agent on a task.
-  - `agent` — the name of **one of your own agents** to run as the delegate.
-  - `task` — full instructions (the ephemeral brief).
-  - `repo` — absolute path to the source repo.
-  - `branch` — branch for the delegate's worktree, e.g. `delegate/foo`.
-  - `outputContract` — `advisory` (no commits) or `code-change`.
-  - `targetBranch`, `baseCommit`, `mergePolicy` (`manual` | `auto-after-checks`), `startupTimeoutSeconds`.
+**`delegate`** spawns a peer agent on a task:
 
-  Returns immediately. Completion is surfaced asynchronously (toast + a note appended to your
-  prompt) at a safe point — it never interrupts your current turn.
+| Argument | Contract |
+| --- | --- |
+| `agent` | Name of one of your own agents, validated in the source repo's scope. |
+| `task` | Complete instructions, persisted for the delegate to read. |
+| `repo` | Absolute path to the source repo. |
+| `branch` | Fresh branch name, e.g. `delegate/foo`. Existing branches are rejected. |
+| `outputContract` | `advisory` (default, no commits) or `code-change` (commits). |
+| `targetBranch` | Optional intended merge target, not an instruction to merge. |
+| `baseCommit` | Optional base revision, resolved to a commit SHA and used to create the branch/worktree. Defaults to source repo `HEAD`. |
+| `mergePolicy` | Defaults to `manual`. `auto-after-checks` is explicitly rejected. The enum value remains only to give existing callers a clear error. |
+| `startupTimeoutSeconds` | Defaults to 30. Timeout notifies only, without killing the delegate. |
 
-- **`reap_delegate`** — clean up a job kept for inspection (close pane, remove worktree, clear state).
+The call returns after launch setup, without waiting for completion. Jobs belong to the tool
+context's `sessionID`. Notes target that session, with delivery deferred while it is busy.
+
+- **`reap_delegate`** — explicitly close the pane, then remove the clean worktree without force
+  and clear runtime state. Errors retain the tracked job for retry. Optional `deleteBranch`
+  defaults to false and uses `git branch -d`, not `-D`; an unmerged branch is retained if Git
+  refuses deletion. Reply/reap tools only resolve jobs owned by the calling session.
+
+- **`reply_delegate`** — answer a delegate that called `ask` and is blocked. Unblocks it so it can
+  continue. Use this when a completion note reports a delegate is *blocked* on a question.
 
 ### Delegate tools (auto-available inside a delegated agent)
 
 When a delegate boots, the plugin consumes its brief and exposes:
 
+- **`read_task`** — read the persisted task and working instructions. Call this first.
 - **`complete`** — report the outcome (`status`, `summary`, and for code-change: `branch`,
-  `baseCommit`, `headCommit`). Token-authenticated; duplicates rejected.
+  `baseCommit`, `headCommit` on success). Token-authenticated; duplicate completion is rejected.
+  Completion is terminal, with no reopen operation. Use a new job for follow-up work.
 - **`ask`** — ask the coordinator a question and block until answered.
 
 Your delegate agents don't need to know any of the protocol — just tell them (in their own
@@ -77,19 +96,33 @@ instructions) to do the task and call `complete` when done, or `ask` if blocked.
 
 ## How it works
 
-- **Disk is the only transport.** Coordinator and delegate are separate processes; they
-  communicate purely through per-job files in `$XDG_RUNTIME_DIR/herdr/<job-id>/`
-  (`handoff.json`, `result.json`, `block.json`, `reply.json`, `heartbeat`) — never a socket.
-- **File-watches are the events.** The coordinator watches each job-dir; results/blocks enqueue
-  events drained between turns. A mid-run heartbeat distinguishes a working delegate from a
-  crashed one.
-- **Verification & merge.** Advisory results are trusted. Code-change results are machine-checked
-  (clean tree, ≥1 commit, head reachable from branch, base ancestor of head, no protocol files
-  committed); under `auto-after-checks` the coordinator builds a synthetic merge in an isolated
-  worktree, runs declared checks, guards against target drift, and merges only the validated result.
-- **Clean teardown.** Plain `git worktree add` under `<repo>/.herdr-envoy/worktrees/` (add
-  `.herdr-envoy/` to your `.gitignore`); jobs auto-reap on completion — no herdr workspaces,
-  no sidebar litter.
+- **Disk protocol.** Per-job files live in `$XDG_RUNTIME_DIR/herdr/<job-id>/` (fallback
+  `<os.tmpdir()>/herdr-<uid>/herdr/<job-id>/`). They include `handoff.json`, `.consumed.json`,
+  `coordinator.json`, `result.json`, `block.json`, `reply.json` and `heartbeat`.
+- **Ownership and recovery.** `coordinator.json` persists the originating session, project
+  directory, coordinator/delegate panes, checkout and notification/cleanup progress. Filesystem
+  watches are wake hints backed by 2-second reconciliation. Restart recovery requires the same
+  project directory and `HERDR_PANE_ID`. Legacy jobs without coordinator metadata cannot be
+  recovered safely and are skipped, not claimed by another session.
+- **Notifications.** Pending notes have persisted stable message IDs, readback and retries.
+  Delivery is deferred while the owning session is busy; toasts are best-effort. This is not an
+  exactly-once delivery guarantee. A stale heartbeat indicates a possible stall, not proof of a crash.
+- **Validation, not approval.** Reports are checked for identity and contract. Successful
+  code-change reports also get basic Git checks: clean tree, at least one commit past the assigned
+  base, head reachable from the assigned branch, base ancestry and a limited protocol-artifact
+  filename check. This does not prove correctness or passing project checks. Advisory content is
+  trusted. Review code changes, run required checks and obtain user approval before merging.
+- **Explicit cleanup.** Each fresh branch starts at the resolved base SHA in
+  `<repo>/.herdr-envoy/worktrees/<job-id>/`, using plain Git rather than a new herdr workspace.
+  Completion keeps the pane, worktree and result available for inspection. There is no automatic
+  merge or completion-triggered reap. Launch failures attempt cleanup; failures remain tracked.
+
+## Development
+
+- `npm test` builds and runs the regression suite using temporary Git repositories and mocked OpenCode/herdr boundaries.
+- `npm run test:coverage` measures all compiled source modules, including the dormant merge helper, and enforces 95% line/function and 90% branch coverage. The suite is validated on Node.js 24, using its coverage and mock-timer APIs.
+- `npm run typecheck` checks TypeScript without emitting files.
+- Automated coverage does not replace a live herdr/OpenCode smoke test for pane startup and message processing.
 
 ## Notes
 

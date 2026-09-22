@@ -38,6 +38,7 @@ export function startHeartbeat(jobDir: string, intervalMs = 10_000): () => void 
       stopped = true;
       return;
     }
+    if (stopped) return;
     try {
       const now = Date.now();
       await fs.writeFile(hbPath, String(now), { mode: 0o600 });
@@ -63,6 +64,9 @@ export async function consume(jobDir: string): Promise<DelegateState> {
   if (await exists(consumedPath)) {
     // Already consumed (e.g. plugin reload) — recover auth AND task from snapshot.
     const consumed = await readJSON<Consumed>(consumedPath);
+    if (consumed.protocolVersion !== PROTOCOL_VERSION) {
+      throw new Error(`peer-delegate: protocol mismatch ${consumed.protocolVersion}`);
+    }
     return { jobDir, task: consumed.task ?? null, consumed };
   }
   if (!(await exists(handoffPath))) {
@@ -113,6 +117,7 @@ export function readTaskTool(state: DelegateState) {
       const envelope =
         `You are a delegated peer worker. Carry out the following task in this worktree.\n\n` +
         `## Task\n${task}\n\n` +
+        (outputContract === "code-change" ? `Assigned base commit: ${c?.baseCommit}. Target branch: ${c?.targetBranch || "not specified"}.\n\n` : "") +
         `## When done\n` +
         `Call the \`complete\` tool with a status ("success" or "failure") and a one-sentence summary` +
         (outputContract === "code-change"
@@ -215,7 +220,7 @@ export function askTool(state: DelegateState) {
         if (ctx.abort.aborted) throw new Error("aborted while blocked");
         if (await exists(replyPath)) {
           const reply = await readJSON<Reply>(replyPath);
-          if (reply.jobId === c.jobId && reply.generation === c.generation) {
+          if (reply.protocolVersion === PROTOCOL_VERSION && reply.jobId === c.jobId && reply.generation === c.generation) {
             await fs.unlink(replyPath).catch(() => {});
             await fs.unlink(blockPath).catch(() => {});
             return reply.answer;
