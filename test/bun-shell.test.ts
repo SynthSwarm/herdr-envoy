@@ -9,7 +9,9 @@ import { jobDir } from "../dist/protocol.js";
 test("cleanup deletes a merged branch using the real Bun shell parser", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "envoy-bun-"));
   const previous = process.env.XDG_RUNTIME_DIR;
+  const previousState = process.env.XDG_STATE_HOME;
   process.env.XDG_RUNTIME_DIR = directory;
+  process.env.XDG_STATE_HOME = path.join(directory, "state");
   const repo = path.join(directory, "repo");
   const coordinator = new Coordinator($ as any, {} as any, repo);
   const id = "a".repeat(32);
@@ -29,6 +31,8 @@ test("cleanup deletes a merged branch using the real Bun shell parser", async ()
     await coordinator.dispose();
     if (previous === undefined) delete process.env.XDG_RUNTIME_DIR;
     else process.env.XDG_RUNTIME_DIR = previous;
+    if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousState;
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

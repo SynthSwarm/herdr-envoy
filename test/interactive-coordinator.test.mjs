@@ -11,7 +11,7 @@ import {
   Coordinator, delegateTool, openSessionTool, listSessionsTool, resumeSessionTool, reapTool,
 } from "../dist/coordinator.js";
 import { consume, readTaskTool, handBackTool } from "../dist/delegate.js";
-import { atomicWriteJSON, readJSON, FILES, JOBDIR_ENV, root, sessionRoot } from "../dist/protocol.js";
+import { atomicWriteJSON, readJSON, FILES, JOBDIR_ENV, root, sessionRoot, withSessionLock } from "../dist/protocol.js";
 
 const exec = promisify(execFile);
 const owner = { sessionID: "orchestrator" };
@@ -49,12 +49,15 @@ async function fixture(t) {
   const calls = [];
   const panes = new Map([["coordinator-pane", { pane_id: "coordinator-pane", workspace_id: "parent" }]]);
   const workspaces = new Map([["parent", { workspace_id: "parent" }], ["unrelated", { workspace_id: "unrelated" }]]);
+  const sources = new Map([["parent", { repo_root: repo, source_checkout_path: repo, source_workspace_id: "parent" }]]);
   const options = {
     failPrompt: false, failRun: false, failOpen: false, failClose: false,
     failCreateAfterSideEffect: false, failRename: false,
-    onPrompt: undefined, onPost: undefined,
+    onPrompt: undefined, onPost: undefined, onCreate: undefined,
     paneList: undefined, workspaceList: undefined, alreadyOpen: false,
+    worktreeList: undefined, parentList: undefined, failGitInventory: false,
     busy: false, loseResponse: false, receiptParts: undefined,
+    promptStatus: 204, readbackStatus: undefined,
   };
   let nextPane = 0;
   let nextWorkspace = 0;
@@ -80,7 +83,10 @@ async function fixture(t) {
       const [program, resource, action, id] = words;
       const json = (result) => ({ stdout: JSON.stringify({ result }) });
       const flag = (name) => words[words.indexOf(name) + 1];
-      if (program === "git") return exec(program, words.slice(1), { cwd });
+      if (program === "git") {
+        if (options.failGitInventory && words.includes("--porcelain")) throw new Error("git inventory unavailable");
+        return exec(program, words.slice(1), { cwd });
+      }
       if (program === "opencode") {
         assert.deepEqual(words, ["opencode", "agent", "list"]);
         assert.equal(cwd, repo);
@@ -114,17 +120,36 @@ async function fixture(t) {
         closeWorkspace(id);
         return json({});
       }
+      if (resource === "worktree" && action === "list") {
+        const override = words.includes("--workspace") ? options.parentList : options.worktreeList;
+        if (override !== undefined) return json(override);
+        const repoRoot = words.includes("--cwd")
+          ? (await git("-C", flag("--cwd"), "rev-parse", "--show-toplevel")).stdout.trim()
+          : sources.get(flag("--workspace"))?.repo_root;
+        const source = words.includes("--workspace") ? sources.get(flag("--workspace"))
+          : [...sources.values()].find((entry) => entry.repo_root === repoRoot && workspaces.has(entry.source_workspace_id));
+        const inventory = (await git("-C", repoRoot, "worktree", "list", "--porcelain", "-z")).stdout;
+        const worktrees = inventory.split("\0\0").filter(Boolean).map((record) => {
+          const fields = record.split("\0");
+          return { path: fields.find((field) => field.startsWith("worktree ")).slice(9),
+            branch: fields.find((field) => field.startsWith("branch refs/heads/"))?.slice("branch refs/heads/".length) };
+        });
+        return json({ source: source ?? { repo_root: repoRoot }, worktrees });
+      }
       if (resource === "worktree" && ["create", "open"].includes(action)) {
         assert.ok(workspaces.has(flag("--workspace")), "parent must exist");
         const checkout = flag("--path");
-        if (action === "create") await git("worktree", "add", "--quiet", "-b", flag("--branch"), checkout, flag("--base"));
+        if (action === "create") {
+          await options.onCreate?.(words);
+          await git("-C", sources.get(flag("--workspace")).repo_root, "worktree", "add", "--quiet", "-b", flag("--branch"), checkout, flag("--base"));
+        }
         else {
           if (options.failOpen) throw new Error("worktree open failed");
           assert.equal((await git("-C", checkout, "rev-parse", "--show-toplevel")).stdout.trim(), checkout);
         }
         const existing = [...workspaces.values()].find((workspace) => workspace.path === checkout);
         if (existing) return json({ workspace: existing, root_pane: [...panes.values()].find((pane) => pane.workspace_id === existing.workspace_id), worktree: { path: checkout }, already_open: true });
-        const workspace = { workspace_id: `child-${++nextWorkspace}`, parent_workspace_id: flag("--workspace"), path: checkout };
+        const workspace = { workspace_id: `child-${++nextWorkspace}`, parent_workspace_id: flag("--workspace"), path: checkout, worktree: { checkout_path: checkout } };
         workspaces.set(workspace.workspace_id, workspace);
         const root_pane = addPane(workspace.workspace_id);
         if (action === "create" && options.failCreateAfterSideEffect) throw new Error("worktree create response lost after creation");
@@ -173,11 +198,13 @@ async function fixture(t) {
       const body = await request.json();
       posts.push({ path: url.pathname, ...body });
       await options.onPost?.(body);
+      if (options.promptStatus !== 204) return Response.json({ error: "notification unavailable" }, { status: options.promptStatus });
       messages.set(body.messageID, { parts: options.receiptParts ?? body.parts });
       if (options.loseResponse) throw new Error("lost accepted response");
       return new Response(null, { status: 204 });
     }
     assert.match(url.pathname, /^\/session\/[^/]+\/message\/[^/]+$/);
+    if (options.readbackStatus) return Response.json({ error: "read-back unavailable" }, { status: options.readbackStatus });
     const message = messages.get(url.pathname.split("/").at(-1));
     return Response.json(message ?? { error: "message missing" }, { status: message ? 200 : 404 });
   } });
@@ -189,18 +216,24 @@ async function fixture(t) {
   const c = coordinator();
   const metadata = (job) => readJSON(path.join(job.jobDir, FILES.coordinator));
   const state = (job) => readJSON(path.join(job.jobDir, FILES.session));
+  const logs = async () => {
+    const directory = path.join(process.env.XDG_STATE_HOME, "herdr-envoy", "logs");
+    const files = await fs.readdir(directory);
+    return (await Promise.all(files.filter((file) => file.endsWith(".jsonl")).sort().map(async (file) =>
+      (await fs.readFile(path.join(directory, file), "utf8")).trim().split("\n").map((line) => JSON.parse(line))))).flat();
+  };
   // A watch scan may already be reading the preceding state. Join it, then scan fresh.
   const settle = async (job, coord = c) => { await coord.reconcile(job.jobId); await coord.reconcile(job.jobId); };
   let sequence = 0;
-  const open = async (overrides = {}, context = owner) => {
+  const open = async (overrides = {}, context = owner, coord = c) => {
     const number = ++sequence;
     const args = { agent: "worker", name: `session-${number}`, task: "Work with the user", repo, branch: `interactive/test-${number}`, baseCommit: base, ...overrides };
-    const output = await openSessionTool(c).execute(args, context);
+    const output = await openSessionTool(coord).execute(args, context);
     const jobId = /\(([a-f0-9]{32})\)/.exec(output)?.[1];
     assert.ok(jobId, output);
     const job = { jobId, jobDir: path.join(sessionRoot(), jobId), output, args };
     Object.assign(job, await metadata(job));
-    await settle(job);
+    await settle(job, coord);
     return job;
   };
   const bind = async (job) => {
@@ -217,8 +250,8 @@ async function fixture(t) {
     await settle(job);
     return state(job);
   };
-  return { dir, repo, base, git, c, coordinator, calls, panes, workspaces, closeWorkspace, options,
-    conversations, messages, posts, gets, metadata, state, settle, open, bind, handBack };
+  return { dir, repo, base, git, c, coordinator, calls, panes, workspaces, sources, closeWorkspace, options,
+    conversations, messages, posts, gets, metadata, state, logs, settle, open, bind, handBack };
 }
 
 test("open_session defaults to pane placement and persists an interactive handoff in the durable root", async (t) => {
@@ -268,7 +301,8 @@ test("durable recovery survives a changed pane and runtime loss but lists only t
   await recovered.recover();
   await f.settle(job, recovered);
   const listed = JSON.parse(await listSessionsTool(recovered).execute({}, owner));
-  assert.deepEqual(listed, [{ jobId: job.jobId, name: job.name, status: "paused", phase: "running", placement: "pane", worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: paused.sessionID, summary: paused.summary }]);
+  assert.deepEqual(listed, [{ jobId: job.jobId, name: job.name, status: "paused", phase: "running", placement: "pane", worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: paused.sessionID, summary: paused.summary,
+    generation: paused.generation, checks: paused.checks, risks: paused.risks, notificationPending: false }]);
   assert.equal(recovered.resolveJobId(other.jobId, owner.sessionID), undefined);
   assert.equal(recovered.resolveJobId(bounded.jobId), undefined);
   assert.equal(JSON.parse(await recovered.listSessions("other-orchestrator"))[0].jobId, other.jobId);
@@ -422,6 +456,137 @@ test("resume without a jobId selects exactly one owned paused session and refuse
   assert.deepEqual(await f.state(second), secondPaused);
 });
 
+test("a stale paused-to-commit hand-back waits for resume's shared lock and cannot overwrite the active generation", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  const paused = await f.handBack(job);
+  const { delegate, context } = await f.bind(job);
+  const lock = path.join(sessionRoot(), ".locks", job.jobId);
+  let contended = () => {};
+  const realOpen = fs.open.bind(fs);
+  t.mock.method(fs, "open", async (...args) => {
+    try { return await realOpen(...args); }
+    catch (error) {
+      if (args[0] === lock && error.code === "EEXIST") contended();
+      throw error;
+    }
+  });
+  let publication;
+  f.options.onPrompt = async () => {
+    assert.equal(await fs.readFile(lock, "utf8"), String(process.pid));
+    await assert.rejects(withSessionLock(job.jobId, async () => assert.fail("shared lock was not held")), /being updated by another coordinator/);
+    // Observe this peer's contention, not the explicit lock probe above.
+    let peerContended;
+    const peerContention = new Promise((resolve) => { peerContended = resolve; });
+    contended = peerContended;
+    publication = handBackTool(delegate).execute({ disposition: "commit", summary: "Stale commit request", userInstruction: "Hand back the paused work for commit" }, context)
+      .then((value) => ({ value }), (error) => ({ error }));
+    await Promise.race([peerContention, publication.then(() => assert.fail("hand-back completed without waiting for resume's lock"))]);
+    const active = await f.state(job);
+    assert.equal(active.status, "active");
+    assert.equal(active.generation, paused.generation + 1);
+    assert.equal(active.handbackID, undefined);
+  };
+  await f.c.resumeSession(job.jobId, "Continue with new work");
+  assert.ok(publication);
+  const result = await publication;
+  assert.match(result.error?.message ?? "", /generation changed; reread read_task/);
+  const active = await f.state(job);
+  assert.equal(active.status, "active");
+  assert.equal(active.generation, paused.generation + 1);
+  assert.equal(active.summary, paused.summary);
+  assert.equal(active.handbackID, undefined);
+  await f.settle(job);
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
+});
+
+test("a paused-to-commit publication holds the shared lock until durable, then resume uses that hand-back", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  const paused = await f.handBack(job);
+  const { delegate, context } = await f.bind(job);
+  await f.c.dispose();
+  let arrived;
+  let release;
+  const publishing = new Promise((resolve) => { arrived = resolve; });
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const realRename = fs.rename.bind(fs);
+  const rename = t.mock.method(fs, "rename", async (source, destination) => {
+    if (destination === path.join(job.jobDir, FILES.session)) {
+      arrived();
+      await barrier;
+    }
+    return realRename(source, destination);
+  });
+  const publication = handBackTool(delegate).execute({ disposition: "commit", summary: "Final paused work", userInstruction: "Hand back for commit" }, context)
+    .then((value) => ({ value }), (error) => ({ error }));
+  try {
+    await Promise.race([publishing, publication.then(() => assert.fail("hand-back did not reach the publication barrier"))]);
+    await assert.rejects(f.c.resumeSession(job.jobId), /being updated by another coordinator/);
+    assert.deepEqual(await f.state(job), paused);
+    assert.equal(f.calls.filter((args) => args[2] === "prompt").length, 0);
+  } finally {
+    release();
+    await publication;
+    rename.mock.restore();
+  }
+  assert.ifError((await publication).error);
+  const ready = await f.state(job);
+  assert.equal(ready.status, "commit");
+  assert.equal(ready.generation, paused.generation);
+  assert.notEqual(ready.handbackID, paused.handbackID);
+  assert.match(await f.c.resumeSession(job.jobId), /Previous hand-back \(commit, generation \d+\): Final paused work/);
+  const active = await f.state(job);
+  assert.equal(active.status, "active");
+  assert.equal(active.generation, paused.generation + 1);
+  assert.equal(active.summary, ready.summary);
+  assert.equal(active.handbackID, undefined);
+});
+
+test("failure on resume's second metadata save preserves durable intent and the pending notice for recovery", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  f.options.busy = true;
+  const paused = await f.handBack(job);
+  const previous = await f.metadata(job);
+  await f.c.dispose();
+  const realRename = fs.rename.bind(fs);
+  let saves = 0;
+  const rename = t.mock.method(fs, "rename", async (source, destination) => {
+    if (destination === path.join(job.jobDir, FILES.coordinator) && ++saves === 2) {
+      throw new Error("second metadata save failed");
+    }
+    return realRename(source, destination);
+  });
+  await assert.rejects(f.c.resumeSession(job.jobId, "Recover this resume"), /second metadata save failed/);
+  rename.mock.restore();
+  assert.equal(saves, 2);
+  assert.deepEqual(await f.state(job), paused);
+  const interrupted = await f.metadata(job);
+  assert.deepEqual(interrupted.resuming, { generation: paused.generation + 1, instructions: "Recover this resume" });
+  assert.deepEqual(interrupted.pending, previous.pending);
+  assert.deepEqual(interrupted.delivered, []);
+  assert.equal(f.calls.filter((args) => args[2] === "prompt").length, 0);
+  const recovered = f.coordinator();
+  await recovered.recover();
+  await f.settle(job, recovered);
+  assert.deepEqual(await f.metadata(job), interrupted, "busy reconciliation must preserve recoverable intent and pending delivery");
+  assert.equal(f.posts.length, 0);
+  await recovered.resumeSession(job.jobId, "Recover this resume");
+  const active = await f.state(job);
+  assert.equal(active.status, "active");
+  assert.equal(active.generation, interrupted.resuming.generation);
+  assert.equal(active.handbackID, undefined);
+  assert.equal((await f.metadata(job)).resuming, undefined);
+  assert.equal((await f.metadata(job)).pending, undefined);
+  assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
+  f.options.busy = false;
+  await f.settle(job, recovered);
+  assert.equal(f.posts.length, 0, "explicit retry must retire the old pause rather than replay it");
+  assert.equal(f.calls.filter((args) => args[2] === "prompt").length, 1);
+});
+
 test("a closed pane relaunches the saved conversation with --session without recreating its dirty checkout", async (t) => {
   const f = await fixture(t);
   const job = await f.open();
@@ -455,11 +620,16 @@ for (const [label, override] of [
   test(`resume refuses a live pane with ${label} without changing paused control`, async (t) => {
     const f = await fixture(t);
     const job = await f.open();
+    f.options.busy = true;
     const paused = await f.handBack(job);
+    const metadata = await f.metadata(job);
+    assert.equal(metadata.pending.key, `handback:${paused.handbackID}`);
     Object.assign(f.panes.get(job.pane), override);
     const start = f.calls.length;
     await assert.rejects(f.c.resumeSession(job.jobId), /busy or its conversation identity cannot be verified/);
     assert.deepEqual(await f.state(job), paused);
+    assert.deepEqual(await f.metadata(job), metadata, "failed validation must not retire the pending notice");
+    assert.equal(f.posts.length, 0);
     assert.ok(!f.calls.slice(start).some((args) => ["prompt", "split", "run", "close"].includes(args[2])));
     await fs.access(job.worktree);
   });
@@ -506,6 +676,61 @@ test("subworkspace create and reopen retain the original parent and own only the
   assert.deepEqual(f.calls.filter((args) => args[2] === "close"), [["herdr", "workspace", "close", metadata.workspace]]);
 });
 
+test("subworkspace placement uses the target repository's parent rather than the caller's workspace", async (t) => {
+  const f = await fixture(t);
+  const callerRepo = path.join(f.dir, "caller repo");
+  await f.git("init", "-q", "--initial-branch=main", callerRepo);
+  await f.git("-C", callerRepo, "commit", "-q", "--allow-empty", "-m", "caller base");
+  f.sources.set("unrelated", { repo_root: callerRepo, source_checkout_path: callerRepo, source_workspace_id: "unrelated" });
+  f.panes.get("coordinator-pane").workspace_id = "unrelated";
+  const caller = f.coordinator(callerRepo);
+  const job = await f.open({ placement: "subworkspace" }, owner, caller);
+  assert.equal(job.parentWorkspace, "parent");
+  assert.equal(f.workspaces.get(job.workspace).parent_workspace_id, "parent");
+  assert.deepEqual(f.calls.filter((args) => args[1] === "worktree" && args[2] === "list"), [
+    ["herdr", "worktree", "list", "--cwd", f.repo, "--json"],
+    ["herdr", "worktree", "list", "--workspace", "parent", "--json"],
+  ]);
+  assert.equal((await f.git("-C", job.worktree, "rev-parse", "HEAD")).stdout.trim(), f.base);
+  await f.git("show-ref", "--verify", `refs/heads/${job.branch}`);
+  await assert.rejects(f.git("-C", callerRepo, "show-ref", "--verify", `refs/heads/${job.branch}`));
+  assert.ok(!f.calls.some((args) => args[1] === "pane" && ["get", "split"].includes(args[2])));
+});
+
+test("subworkspace parent verification compares real repository roots rather than path spelling", async (t) => {
+  const f = await fixture(t);
+  const alias = path.join(f.dir, "repo alias");
+  await fs.symlink(f.repo, alias, "dir");
+  f.options.parentList = { source: { repo_root: alias, source_checkout_path: alias } };
+  const job = await f.open({ placement: "subworkspace" });
+  assert.equal(job.parentWorkspace, "parent");
+  assert.equal((await f.git("-C", job.worktree, "rev-parse", "HEAD")).stdout.trim(), f.base);
+  assert.equal(f.calls.filter((args) => args[2] === "create").length, 1);
+});
+
+test("subworkspace placement refuses a repository with no parent workspace without creating resources", async (t) => {
+  const f = await fixture(t);
+  f.sources.clear();
+  await assert.rejects(f.open({ placement: "subworkspace" }), /Cannot identify a parent workspace for the requested repository/);
+  assert.ok(!f.calls.some((args) => ["create", "open", "run", "split", "close"].includes(args[2]) || args.includes("remove")));
+  assert.deepEqual((await f.git("for-each-ref", "--format=%(refname)", "refs/heads/")).stdout.trim().split("\n"), ["refs/heads/main"]);
+  assert.deepEqual(JSON.parse(await f.c.listSessions(owner.sessionID)), []);
+});
+
+for (const mismatch of ["repository", "checkout"]) {
+  test(`subworkspace placement refuses a recorded parent with the wrong ${mismatch} before creation`, async (t) => {
+    const f = await fixture(t);
+    const otherRepo = path.join(f.dir, "wrong repo");
+    await f.git("init", "-q", "--initial-branch=main", otherRepo);
+    f.options.parentList = { source: { repo_root: mismatch === "repository" ? otherRepo : f.repo, source_checkout_path: otherRepo } };
+    await assert.rejects(f.open({ placement: "subworkspace" }), /Recorded parent workspace does not match the requested repository root/);
+    assert.ok(f.calls.some((args) => args[2] === "list" && args.includes("--workspace") && args.includes("parent")));
+    assert.ok(!f.calls.some((args) => ["create", "open", "run", "split", "close"].includes(args[2]) || args.includes("remove")));
+    assert.deepEqual(JSON.parse(await f.c.listSessions(owner.sessionID)), []);
+    assert.equal(f.workspaces.has("parent"), true);
+  });
+}
+
 test("bounded delegation also supports subworkspace placement with runtime state and child-only cleanup", async (t) => {
   const f = await fixture(t);
   const args = { agent: "worker", task: "Bounded work", repo: f.repo, branch: "bounded/subworkspace", placement: "subworkspace", outputContract: "advisory", baseCommit: f.base };
@@ -537,7 +762,10 @@ for (const failure of ["identity", "checkout", "conversation", "conversation id"
   test(`resume refuses missing or changed ${failure} rather than creating a substitute`, async (t) => {
     const f = await fixture(t);
     const job = await f.open({ placement: failure === "parent" ? "subworkspace" : "pane" });
+    f.options.busy = true;
     const paused = await f.handBack(job);
+    const metadata = await f.metadata(job);
+    assert.equal(metadata.pending.key, `handback:${paused.handbackID}`);
     let expected;
     if (failure === "identity") {
       delete paused.sessionID;
@@ -569,8 +797,14 @@ for (const failure of ["identity", "checkout", "conversation", "conversation id"
     assert.equal(after.status, "paused");
     assert.equal(after.sessionID, paused.sessionID);
     assert.equal(after.completionToken, paused.completionToken);
-    assert.equal(after.handbackID, paused.handbackID);
+      assert.equal(after.handbackID, failure === "parent" ? undefined : paused.handbackID);
     assert.equal(after.generation, paused.generation + (failure === "parent" ? 1 : 0));
+    if (failure !== "parent") {
+      assert.deepEqual(after, paused);
+      assert.deepEqual(await f.metadata(job), metadata, "failed validation must not retire the pending notice");
+      assert.ok(!(await f.logs()).some((record) => ["notification_superseded", "resume_started"].includes(record.event)));
+    }
+    assert.equal(f.posts.length, 0);
     assert.ok(!f.calls.slice(start).some((args) => ["create", "open", "split", "run", "prompt", "close"].includes(args[2])));
     assert.equal(f.c.resolveJobId(job.jobId), job.jobId);
     if (failure !== "checkout") await fs.access(job.worktree);
@@ -593,7 +827,7 @@ for (const failure of ["prompt", "run", "open"]) {
     assert.equal(after.status, "paused");
     assert.equal(after.generation, paused.generation + 1);
     assert.equal(after.sessionID, paused.sessionID);
-    assert.equal(after.handbackID, paused.handbackID);
+    assert.equal(after.handbackID, undefined);
     assert.equal(await fs.readFile(path.join(job.worktree, "draft.txt"), "utf8"), "must survive failure");
     assert.ok(!f.calls.slice(start).some((args) => args[2] === "close" || args.includes("remove") || args.includes("-D")));
     assert.equal(f.c.resolveJobId(job.jobId), job.jobId);
@@ -614,16 +848,21 @@ for (const disposition of ["pause", "commit", "discard"]) {
     const paused = await f.handBack(job);
     await fs.writeFile(path.join(job.worktree, "draft.txt"), "work completed during resume");
     let newer;
+    let publication;
+    let publicationError;
     f.options.onPrompt = async () => {
       const delegate = await consume(job.jobDir);
       const context = { sessionID: paused.sessionID };
       await readTaskTool(delegate).execute({}, context);
-      await handBackTool(delegate).execute({ disposition, summary: "New work after resuming", checks: ["new checks"], risks: ["new risks"], userInstruction: `Please ${disposition} the new work.` }, context);
-      newer = await f.state(job);
+      // A real peer runs concurrently, not inside the CLI request's promise.
+      publication = handBackTool(delegate).execute({ disposition, summary: "New work after resuming", checks: ["new checks"], risks: ["new risks"], userInstruction: `Please ${disposition} the new work.` }, context)
+        .then(() => f.state(job)).then((state) => { newer = state; }, (error) => { publicationError = error; });
     };
     f.options.failPrompt = true;
     const start = f.calls.length;
     await assert.rejects(f.c.resumeSession(job.jobId), /Resume failed/);
+    await publication;
+    assert.ifError(publicationError);
     assert.ok(newer);
     assert.equal(newer.generation, paused.generation + 1);
     assert.equal(newer.sessionID, paused.sessionID);
@@ -646,7 +885,8 @@ for (const livePane of [true, false]) {
     const job = await f.open();
     const paused = await f.handBack(job);
     await f.c.dispose();
-    const active = { ...paused, status: "active", generation: paused.generation + 1 };
+    const { handbackID, ...previous } = paused;
+    const active = { ...previous, status: "active", generation: paused.generation + 1 };
     const metadata = await f.metadata(job);
     metadata.resuming = { generation: active.generation, instructions: "Continue saved work" };
     await atomicWriteJSON(path.join(job.jobDir, FILES.coordinator), metadata);
@@ -696,25 +936,169 @@ test("an already-open child refuses duplicate conversation launch and remains pa
   await fs.access(job.worktree);
 });
 
-test("unacknowledged hand-back blocks resume until exact delivery read-back succeeds", async (t) => {
+for (const disposition of ["pause", "commit"]) {
+  test(`a busy orchestrator's pending ${disposition} hand-back does not block explicit resume or grant commit or reap permission`, async (t) => {
+    const f = await fixture(t);
+    const job = await f.open();
+    await fs.writeFile(path.join(job.worktree, "draft.txt"), "changes still needed\n");
+    f.options.busy = true;
+    const previous = await f.handBack(job, disposition);
+    const metadata = await f.metadata(job);
+    assert.equal(metadata.pending.key, `handback:${previous.handbackID}`);
+    assert.equal(metadata.pending.attemptedAt, undefined);
+    assert.deepEqual(metadata.delivered, []);
+    assert.equal(f.posts.length, 0);
+    assert.deepEqual(JSON.parse(await listSessionsTool(f.c).execute({}, owner)), [{
+      jobId: job.jobId, name: job.name, status: previous.status, phase: "running", placement: "pane",
+      worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: previous.sessionID,
+      summary: previous.summary, generation: previous.generation, checks: previous.checks, risks: previous.risks,
+      notificationPending: true,
+    }]);
+    const start = f.calls.length;
+    const result = await resumeSessionTool(f.c).execute({ jobId: job.jobId, instructions: "Make the requested changes before another hand-back" }, owner);
+    assert.ok(result.includes(`Previous hand-back (${previous.status}, generation ${previous.generation}): ${previous.summary}`));
+    assert.ok(result.includes(`Checks: ${previous.checks.join("; ")}`));
+    assert.ok(result.includes(`Risks: ${previous.risks.join("; ")}`));
+    assert.match(result, /Do not commit or reap until a new hand-back/);
+    const { handbackID, ...previousControl } = previous;
+    assert.deepEqual(await f.state(job), { ...previousControl, status: "active", generation: previous.generation + 1 });
+    assert.equal((await f.metadata(job)).pending, undefined);
+    assert.deepEqual((await f.metadata(job)).delivered, [`handback:${previous.handbackID}`]);
+    const prompts = f.calls.slice(start).filter((args) => args[2] === "prompt");
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0][3], job.pane);
+    assert.match(prompts[0][4], /Call read_task to refresh control.*Make the requested changes/);
+    for (const options of [{}, { deleteBranch: true }, { discard: true, confirmation: job.jobId }]) {
+      await assert.rejects(f.c.reap(job.jobId, options), /Active or paused sessions must be handed back/);
+    }
+    assert.ok(!f.calls.slice(start).some((args) => ["commit", "merge", "push", "remove", "-d", "-D"].some((word) => args.includes(word)) || ["close", "split", "run", "create", "open"].includes(args[2])));
+    assert.equal((await f.git("rev-parse", job.branch)).stdout.trim(), f.base);
+    assert.equal(await fs.readFile(path.join(job.worktree, "draft.txt"), "utf8"), "changes still needed\n");
+    await f.c.dispose();
+    f.options.busy = false;
+    const recovered = f.coordinator();
+    await recovered.recover();
+    await f.settle(job, recovered);
+    assert.equal(f.posts.length, 0, "the retired hand-back must not be submitted after restart");
+    assert.deepEqual((await f.metadata(job)).delivered, [`handback:${previous.handbackID}`]);
+    const [listed] = JSON.parse(await listSessionsTool(recovered).execute({}, owner));
+    assert.equal(listed.status, "active");
+    assert.equal(listed.generation, previous.generation + 1);
+    assert.equal(listed.notificationPending, false);
+    assert.equal(Object.hasOwn(listed, "notificationAttemptedAt"), false);
+  });
+}
+
+for (const failure of ["HTTP 503 submission", "HTTP 503 read-back", "mismatched read-back"]) {
+  test(`unacknowledged hand-back after ${failure} does not block explicit resume or replay after restart`, async (t) => {
+    const f = await fixture(t);
+    t.mock.method(console, "error", () => {});
+    const job = await f.open();
+    if (failure === "HTTP 503 submission") f.options.promptStatus = 503;
+    else if (failure === "HTTP 503 read-back") f.options.readbackStatus = 503;
+    else f.options.receiptParts = [{ type: "text", text: "not the submitted hand-back" }];
+    const paused = await f.handBack(job);
+    const pending = (await f.metadata(job)).pending;
+    assert.equal(pending.key, `handback:${paused.handbackID}`);
+    assert.deepEqual((await f.metadata(job)).delivered, []);
+    const attempted = failure !== "HTTP 503 read-back";
+    assert.equal(f.posts.length, attempted ? 1 : 0);
+    if (attempted) assert.ok(Number.isSafeInteger(pending.attemptedAt) && pending.attemptedAt > 0);
+    else assert.equal(pending.attemptedAt, undefined);
+    const [listed] = JSON.parse(await listSessionsTool(f.c).execute({}, owner));
+    assert.equal(listed.notificationPending, true);
+    assert.equal(listed.notificationAttemptedAt, pending.attemptedAt);
+    assert.equal(listed.generation, paused.generation);
+    assert.deepEqual(listed.checks, paused.checks);
+    assert.deepEqual(listed.risks, paused.risks);
+    const result = await resumeSessionTool(f.c).execute({ jobId: job.jobId }, owner);
+    for (const text of [paused.summary, ...paused.checks, ...paused.risks]) assert.ok(result.includes(text));
+    const { handbackID, ...previousControl } = paused;
+    assert.deepEqual(await f.state(job), { ...previousControl, status: "active", generation: paused.generation + 1 });
+    assert.deepEqual(f.gets, [{ path: `/session/${paused.sessionID}`, directory: job.worktree }]);
+    assert.equal((await f.metadata(job)).pending, undefined);
+    assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
+    await f.c.dispose();
+    f.options.promptStatus = 204;
+    f.options.readbackStatus = undefined;
+    f.options.receiptParts = undefined;
+    const recovered = f.coordinator();
+    await recovered.recover();
+    await f.settle(job, recovered);
+    assert.equal(f.posts.length, attempted ? 1 : 0, "recovery must not replay the retired notice");
+    assert.equal((await f.metadata(job)).pending, undefined);
+    assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
+  });
+}
+
+test("a commit hand-back supersedes an undelivered pause and only the commit note is sent", async (t) => {
   const f = await fixture(t);
   const job = await f.open();
-  f.options.receiptParts = [{ type: "text", text: "not the submitted hand-back" }];
+  f.options.busy = true;
   const paused = await f.handBack(job);
-  const pending = (await f.metadata(job)).pending;
-  assert.ok(pending);
-  assert.deepEqual((await f.metadata(job)).delivered, []);
-  await assert.rejects(f.c.resumeSession(job.jobId), /Hand-back delivery is pending/);
-  assert.deepEqual(await f.state(job), paused);
-  assert.equal(f.gets.length, 0);
-  assert.equal(f.posts.length, 1);
-  f.messages.set(pending.messageID, { parts: f.posts[0].parts });
+  assert.equal((await f.metadata(job)).pending.key, `handback:${paused.handbackID}`);
+  assert.equal(f.posts.length, 0);
+  const { delegate, context } = await f.bind(job);
+  await handBackTool(delegate).execute({ disposition: "commit", summary: "Final work ready for review", checks: ["final check passed"], risks: ["final review needed"], userInstruction: "Hand this back for commit instead of leaving it paused" }, context);
+  const ready = await f.state(job);
+  assert.equal(ready.status, "commit");
+  assert.equal(ready.generation, paused.generation);
+  assert.notEqual(ready.handbackID, paused.handbackID);
   await f.settle(job);
-  assert.equal((await f.metadata(job)).pending, undefined);
   assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
-  await f.c.resumeSession(job.jobId);
-  assert.equal((await f.state(job)).status, "active");
+  assert.equal((await f.metadata(job)).pending.key, `handback:${ready.handbackID}`);
+  assert.equal(f.posts.length, 0);
+  f.options.busy = false;
+  await f.settle(job);
   assert.equal(f.posts.length, 1);
+  const text = f.posts[0].parts[0].text;
+  assert.match(text, /READY FOR COMMIT/);
+  assert.doesNotMatch(text, /PAUSED/);
+  for (const value of [ready.summary, ...ready.checks, ...ready.risks, ready.userInstruction]) assert.ok(text.includes(value));
+  assert.ok(!text.includes(paused.summary));
+  assert.equal((await f.metadata(job)).pending, undefined);
+  assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`, `handback:${ready.handbackID}`]);
+  await f.c.dispose();
+  const recovered = f.coordinator();
+  await recovered.recover();
+  await f.settle(job, recovered);
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual(await f.state(job), ready);
+});
+
+test("cleanup retains content-free lifecycle logs after deleting the job, including failed and successful resume events", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open({ name: "Private session name", task: "Private task text" });
+  f.options.busy = true;
+  const paused = await f.handBack(job);
+  f.panes.get(job.pane).agent_status = "working";
+  await assert.rejects(f.c.resumeSession(job.jobId, "Private failed resume instruction"), /busy or its conversation identity/);
+  f.panes.get(job.pane).agent_status = "idle";
+  await f.c.resumeSession(job.jobId, "Private successful resume instruction");
+  await f.handBack(job, "commit");
+  await f.c.reap(job.jobId);
+  await assert.rejects(fs.access(job.jobDir), { code: "ENOENT" });
+  await assert.rejects(fs.access(job.worktree), { code: "ENOENT" });
+  const records = await f.logs();
+  assert.ok(records.length > 0);
+  const events = records.map((record) => record.event);
+  assert.deepEqual(events.filter((event) => event.startsWith("resume_")), ["resume_failed", "resume_started", "resume_completed"]);
+  assert.deepEqual(events.filter((event) => event.startsWith("cleanup_")), ["cleanup_started", "cleanup_completed"]);
+  assert.ok(records.some((record) => record.event === "notification_superseded" && record.reason === "resume"));
+  for (const event of ["resume_started", "resume_completed"]) {
+    assert.equal(records.find((record) => record.event === event).generation, paused.generation + 1);
+  }
+  for (const record of records) {
+    assert.equal(record.jobId, job.jobId);
+    assert.equal(new Date(record.time).toISOString(), record.time);
+    assert.ok(Object.keys(record).every((key) => ["time", "jobId", "event", "generation", "disposition", "reason", "httpStatus"].includes(key)));
+  }
+  const text = JSON.stringify(records);
+  for (const value of [job.name, job.args.task, job.worktree, job.branch, job.repo, paused.sessionID,
+    paused.completionToken, paused.summary, ...paused.checks, ...paused.risks, paused.userInstruction,
+    "Private failed resume instruction", "Private successful resume instruction", "Saved pane is busy"]) {
+    assert.ok(!text.includes(value), `Lifecycle logs leaked ${value}`);
+  }
 });
 
 test("accepted hand-back with a lost response recovers by read-back without duplicate delivery", async (t) => {
@@ -729,10 +1113,66 @@ test("accepted hand-back with a lost response recovers by read-back without dupl
   assert.equal((await f.metadata(job)).pending, undefined);
 });
 
+test("a startup-timeout notice stays pending across busy scans and delivers once when idle", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  f.options.busy = true;
+  t.mock.timers.enable({ apis: ["Date"], now: job.createdAt + job.startupTimeoutSeconds * 1000 + 1 });
+  await f.settle(job);
+  const pending = (await f.metadata(job)).pending;
+  assert.equal(pending.key, "startup-timeout");
+  assert.equal(pending.attemptedAt, undefined);
+  await f.settle(job);
+  assert.deepEqual((await f.metadata(job)).pending, pending);
+  assert.deepEqual((await f.metadata(job)).delivered, []);
+  assert.equal(f.posts.length, 0);
+  assert.equal((await f.state(job)).status, "active");
+  assert.ok(!(await f.logs()).some((record) => record.event === "notification_superseded"));
+  f.options.busy = false;
+  await f.settle(job);
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].parts[0].text, pending.text);
+  assert.match(pending.text, /failed to start within its timeout/);
+  assert.equal((await f.metadata(job)).pending, undefined);
+  assert.deepEqual((await f.metadata(job)).delivered, ["startup-timeout"]);
+  await f.c.dispose();
+  const recovered = f.coordinator();
+  await recovered.recover();
+  await f.settle(job, recovered);
+  assert.equal(f.posts.length, 1);
+});
+
+test("reconciliation failures log at most once per job per minute while scans keep retrying", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open({ startupTimeoutSeconds: 120 });
+  const state = await f.state(job);
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const errors = t.mock.method(console, "error", () => {});
+  await atomicWriteJSON(path.join(job.jobDir, FILES.session), { ...state, completionToken: "private-invalid-token" });
+  await f.settle(job);
+  const failures = async () => (await f.logs()).filter((record) => record.event === "reconciliation_failed");
+  assert.equal((await failures()).length, 1);
+  t.mock.timers.tick(59_999);
+  await f.settle(job);
+  assert.equal((await failures()).length, 1);
+  assert.equal(errors.mock.callCount(), 1);
+  t.mock.timers.tick(1);
+  await f.settle(job);
+  const records = await failures();
+  assert.equal(records.length, 2);
+  assert.equal(errors.mock.callCount(), 2);
+  assert.deepEqual(records, [now, now + 60_000].map((time) => ({
+    time: new Date(time).toISOString(), jobId: job.jobId, event: "reconciliation_failed", reason: "state",
+  })));
+  await atomicWriteJSON(path.join(job.jobDir, FILES.session), state);
+  await f.handBack(job);
+  assert.equal(f.posts.length, 1, "rate limiting the failure log must not suppress reconciliation itself");
+});
+
 test("two live recovered coordinators lock concurrent hand-back scans and retry without duplicate posts", async (t) => {
   const f = await fixture(t);
-  const errors = [];
-  t.mock.method(console, "error", (...args) => errors.push(args.map(String).join(" ")));
+  t.mock.method(console, "error", () => {});
   const job = await f.open();
   f.options.busy = true;
   const paused = await f.handBack(job);
@@ -747,14 +1187,14 @@ test("two live recovered coordinators lock concurrent hand-back scans and retry 
   await f.settle(job, second);
   assert.equal(first.resolveJobId(job.jobId), job.jobId);
   assert.equal(second.resolveJobId(job.jobId), job.jobId);
-  errors.length = 0;
   let concurrentScan = false;
   f.options.onPost = async (body) => {
     concurrentScan = true;
     assert.equal(await fs.readFile(path.join(sessionRoot(), ".locks", job.jobId), "utf8"), String(process.pid));
     assert.equal((await f.metadata(job)).pending.messageID, body.messageID);
     await Promise.all([second.reconcile(job.jobId), second.reconcile(job.jobId)]);
-    assert.ok(errors.some((message) => /Session is being updated by another coordinator; retry later/.test(message)));
+    assert.equal((await f.metadata(job)).pending.messageID, body.messageID);
+    assert.deepEqual((await f.metadata(job)).delivered, [], "a contender must not acknowledge an in-flight delivery");
     assert.equal(f.posts.length, 1, "a contender must not post while delivery is in flight");
   };
   f.options.busy = false;
@@ -856,12 +1296,96 @@ test("a lost create response after herdr side effects retains uncertain resource
   for (const options of [{}, { deleteBranch: true }, { discard: true, confirmation: jobId, deleteBranch: true }]) {
     await assert.rejects(recovered.reap(jobId, options), /Resource creation is uncertain/);
   }
-  assert.deepEqual(f.calls.slice(start), []);
+  assert.ok(f.calls.slice(start).some((args) => args[1] === "worktree" && args[2] === "list" && args.includes("--cwd")));
+  assert.ok(!f.calls.slice(start).some((args) => ["create", "open", "run", "close"].includes(args[2]) || args.includes("remove") || args.includes("-D")));
   assert.deepEqual(await f.metadata(job), metadata);
   assert.equal(await fs.readFile(path.join(worktree, "draft.txt"), "utf8"), "preserve uncertain resources");
   assert.equal(f.workspaces.has(workspace.workspace_id), true);
   await f.git("show-ref", "--verify", `refs/heads/${metadata.branch}`);
 });
+
+for (const residual of ["none", "wrong-parent branch", "launch", "path", "branch", "worktree inventory", "workspace inventory", "parent inventory", "git inventory"]) {
+  test(`failed creation recovery ${residual === "none" ? "permits cleanup when no resources or launch exist" : `refuses cleanup with ${residual}`}`, async (t) => {
+    const f = await fixture(t);
+    f.options.onCreate = async () => {
+      f.options.workspaceList = {};
+      throw new Error("definitive create failure before side effects");
+    };
+    await assert.rejects(f.open({ placement: "subworkspace" }), /definitive create failure before side effects.*invalid workspace inventory/);
+    const create = f.calls.find((args) => args[2] === "create");
+    const worktree = create[create.indexOf("--path") + 1];
+    const jobId = path.basename(worktree);
+    const job = { jobId, jobDir: path.join(sessionRoot(), jobId) };
+    await f.c.dispose();
+    const metadata = await f.metadata(job);
+    assert.equal(metadata.resourceUncertain, true);
+    assert.equal(metadata.phase, "starting");
+    assert.equal(metadata.launchAttempted, undefined);
+    await assert.rejects(fs.access(worktree), { code: "ENOENT" });
+    await assert.rejects(f.git("show-ref", "--verify", `refs/heads/${metadata.branch}`));
+    f.options.workspaceList = undefined;
+    let expected = /Resource creation is uncertain/;
+    let wrongRepo;
+    if (residual === "wrong-parent branch") {
+      wrongRepo = path.join(f.dir, "old wrong parent repo");
+      await f.git("init", "-q", "--initial-branch=main", wrongRepo);
+      await f.git("-C", wrongRepo, "commit", "-q", "--allow-empty", "-m", "wrong parent base");
+      await f.git("-C", wrongRepo, "branch", metadata.branch);
+      f.sources.set("unrelated", { repo_root: wrongRepo, source_checkout_path: wrongRepo, source_workspace_id: "unrelated" });
+      metadata.parentWorkspace = "unrelated";
+      await atomicWriteJSON(path.join(job.jobDir, FILES.coordinator), metadata);
+      expected = /Uncertain resources remain in the recorded parent repository/;
+    } else if (residual === "launch") {
+      metadata.launchAttempted = true;
+      await atomicWriteJSON(path.join(job.jobDir, FILES.coordinator), metadata);
+    } else if (residual === "path") {
+      await fs.mkdir(worktree);
+      await fs.writeFile(path.join(worktree, "keep.txt"), "unregistered resources");
+    } else if (residual === "branch") {
+      await f.git("branch", metadata.branch);
+    } else if (residual === "worktree inventory") {
+      f.options.worktreeList = {};
+      expected = /invalid worktree inventory/;
+    } else if (residual === "workspace inventory") {
+      f.options.workspaceList = {};
+      expected = /invalid workspace inventory/;
+    } else if (residual === "parent inventory") {
+      f.options.parentList = {};
+      expected = /invalid parent inventory/;
+    } else if (residual === "git inventory") {
+      f.options.failGitInventory = true;
+      expected = /git inventory unavailable/;
+    }
+    const recovered = f.coordinator();
+    await recovered.recover();
+    await f.settle(job, recovered);
+    assert.equal(recovered.resolveJobId(jobId), jobId);
+    const start = f.calls.length;
+    if (residual === "none") {
+      await recovered.reap(jobId, { deleteBranch: true });
+      await assert.rejects(fs.access(job.jobDir), { code: "ENOENT" });
+      await assert.rejects(fs.access(worktree), { code: "ENOENT" });
+      assert.equal(recovered.resolveJobId(jobId), undefined);
+      assert.ok((await f.logs()).some((record) => record.event === "creation_reconciled"));
+      assert.ok(f.calls.slice(start).some((args) => args.includes("--porcelain") && args.includes("-z")));
+      assert.ok(f.calls.slice(start).some((args) => args.includes("for-each-ref")));
+      assert.ok(f.calls.slice(start).some((args) => args[1] === "workspace" && args[2] === "list"));
+      assert.ok(f.calls.slice(start).some((args) => args.includes("--workspace") && args.includes("parent")));
+    } else {
+      await assert.rejects(recovered.reap(jobId, { deleteBranch: true }), expected);
+      assert.deepEqual(await f.metadata(job), metadata);
+      assert.equal(recovered.resolveJobId(jobId), jobId);
+      assert.ok(!(await f.logs()).some((record) => record.event === "creation_reconciled"));
+      if (wrongRepo) await f.git("-C", wrongRepo, "show-ref", "--verify", `refs/heads/${metadata.branch}`);
+      if (residual === "branch") await f.git("show-ref", "--verify", `refs/heads/${metadata.branch}`);
+      if (residual === "path") assert.equal(await fs.readFile(path.join(worktree, "keep.txt"), "utf8"), "unregistered resources");
+    }
+    assert.ok(!f.calls.slice(start).some((args) => ["create", "open", "run", "close"].includes(args[2]) || args.includes("remove") || args.includes("-D") || args.includes("-d")));
+    assert.equal(f.workspaces.has("parent"), true);
+    assert.equal(f.workspaces.has("unrelated"), true);
+    assert.equal(f.panes.has("coordinator-pane"), true);
+  });
+}
 
 test("pane rename failure after interactive launch preserves the active session and prevents reap", async (t) => {
   const f = await fixture(t);

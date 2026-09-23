@@ -385,7 +385,7 @@ test("invalid block identities are retained for inspection without notifying", a
     await atomicWriteJSON(path.join(job.jobDir, FILES.block), { ...block, ...overrides });
     await f.c.reconcile(job.jobId);
   }
-  assert.equal(errors.mock.callCount(), 4);
+  assert.equal(errors.mock.callCount(), 1, "repeated failures are rate-limited");
   for (const call of errors.mock.calls) assert.match(String(call.arguments[1]), /invalid block identity/);
   assert.equal(f.posts.length, 0);
   assert.deepEqual((await f.metadata(job)).delivered, []);
@@ -680,6 +680,13 @@ test("invalid owners and relative repositories fail before agent discovery", asy
   delete process.env.HERDR_PANE_ID;
   await assert.rejects(f.c.spawnDelegate(job.jobId, f.input), /HERDR_PANE_ID missing/);
   await assert.rejects(f.metadata(job), { code: "ENOENT" });
+});
+
+test("agent discovery accepts all-mode agents without silently choosing another agent", async (t) => {
+  const f = await fixture(t);
+  f.options.agents = "scout (all)\nworker (primary)\n";
+  await f.c.assertAgentExists("scout", f.repo);
+  await assert.rejects(f.c.assertAgentExists("sisyphus", f.repo), /not found.*scout, worker/);
 });
 
 test("spawn authorises .envrc and uses a mocked readiness fallback before launching a shell-safe tiny prompt", async (t) => {

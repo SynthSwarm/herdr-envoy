@@ -30,7 +30,8 @@ handback is user-directed, with review, checks and commit before commit-disposit
 ## Creation and Launch
 
 - `repo` must be absolute, `HERDR_PANE_ID` and a session owner must be present, and the named
-  user-owned agent must exist in the repository's opencode scope.
+  user-owned agent must exist in the repository's opencode scope. Agent listing accepts
+  `primary`, `subagent` and `all` modes.
 - `branch` must be a valid fresh branch. Existing branches are rejected. A supplied `baseCommit`
   is resolved to a commit SHA; otherwise the source repository's `HEAD` is resolved. That SHA is
   recorded and actually used by `git worktree add -b`.
@@ -38,7 +39,11 @@ handback is user-directed, with review, checks and commit before commit-disposit
   branch-derived directories. Add `.herdr-envoy/` to the source repository's `.gitignore`.
   The plugin uses plain Git and splits a pane in the current herdr workspace.
 - With `placement: subworkspace`, use herdr's `worktree create/open --workspace` operations
-  against the recorded parent workspace. Record the returned child workspace, root pane and
+  against the recorded parent workspace. Resolve that parent with
+  `herdr worktree list --cwd <repo>`, including cross-repository requests, and verify its repository
+  root matches the requested Git root by realpath. Never substitute the caller's repository.
+  If no parent workspace exists, refuse and ask the user to open the requested repository in herdr.
+  Record the returned child workspace, root pane and
   checkout rather than guessing IDs or paths. Close only the owned child workspace on cleanup.
   A missing parent is an error, not permission to select another parent or fall back to a pane.
 - For bounded `delegate`, `outputContract` defaults to `advisory` (no commits). `code-change`
@@ -54,7 +59,8 @@ handback is user-directed, with review, checks and commit before commit-disposit
   cleanup using the same non-force cleanup path before interactive process submission. Once an
   interactive launch is attempted, errors retain the session for inspection rather than closing
   a possibly live conversation. Uncertain workspace creation also retains metadata and blocks
-  cleanup until resources are inspected. No placement fallback is attempted.
+  cleanup until inventories prove no resources remain, as described under Explicit Cleanup.
+  No placement fallback is attempted.
 
 ## Interactive Sessions
 
@@ -67,14 +73,19 @@ above. The name is a display label, not a unique key. Interactive sessions do no
 `list_sessions` returns durable interactive sessions for the current project and calling
 orchestrator `sessionID`, including ID, name, placement, state and handback summary. It must not
 return authentication tokens. Recovery may discover other owners' records but listing must not
-expose those sessions to the caller.
+expose those sessions to the caller. It also returns generation, checks, risks,
+`notificationPending` and `notificationAttemptedAt` (the pending note's `attemptedAt`, if attempted).
 
 `resume_session` accepts an optional ID (full or unique prefix of at least eight characters) and
-optional instructions. Without an ID, exactly one eligible owned session must exist. Never
+optional instructions. An explicit ID permits paused or commit-ready work to resume independently
+of pending notification delivery. Without an ID, exactly one paused owned session must exist. Never
 auto-select an ambiguous display name or one of several candidates. Resume requires the same
 originating orchestrator `sessionID` and continues the saved opencode conversation in the same
 worktree and branch, preserving placement and the recorded parent/child relationship. Additional
 instructions supplement the existing conversation, not a replacement brief in a new session.
+Resume returns the previous handback summary, checks and risks and durably supersedes its queued
+notice. It does not commit or reap; a new handback is required before commit or cleanup.
+Discard-requested sessions cannot resume and are never implicitly resurrected.
 
 If the saved conversation, checkout or required parent workspace is missing, refuse safely with
 the missing resource identified. Do not silently create a new conversation or checkout, change
@@ -95,6 +106,11 @@ Handback is not a peer-side commit, merge or cleanup command. A failed review, c
 leaves the session available, without reaping. Pause is resumable and preserves all resources.
 An active or paused interactive session cannot be ordinarily reaped. A discard request is not
 itself authorisation to destroy work.
+
+An explicit `hand_back` may transition paused work to `commit` or `discard` without a resume.
+Same-disposition retries are idempotent and preserve the original report, even when the retry's
+summary, checks or risks differ. Commit/discard handbacks cannot transition through `hand_back`.
+Only explicit orchestrator resume can reopen commit-ready work; discard is not resumable.
 
 ## Disk Protocol
 
@@ -124,7 +140,7 @@ task/name, repository, branch/base/target, placement and parent/child/pane ident
 control, disposition, generation, handback summary/checks/risks and notification/cleanup progress.
 Credentials remain private and are never included in listing responses.
 
-Interactive control is in `session.json`. Coordinator operations use a per-job exclusive lock
+Interactive control is in `session.json`. Coordinator operations and `hand_back` share a per-job exclusive lock
 under `sessions/.locks/`, and reread metadata while holding it. Live owners cause a retryable
 refusal. Dead process owners can be recovered; incomplete locks require manual inspection.
 Resume intent and its generation are persisted before dispatch. An interrupted active resume
@@ -152,7 +168,9 @@ and the opencode client API to notify the owning session. No separate peer socke
 - Submission is deferred when the owning session is reported busy. The note is not redirected
   to another session or inserted into an unsubmitted TUI prompt. Toasts are best-effort only.
   Stable IDs, readback and retries do **not** constitute an exactly-once delivery guarantee.
-- Pending delivery is reconciled before new events. Results take precedence over blocks and
+- Superseded interactive notices are durably retired before delivery, including after explicit
+  resume or a newer handback. Otherwise pending delivery is reconciled before new events.
+  Results take precedence over blocks and
   liveness checks. Block identity, generation and token are checked before notification.
 - Startup timeout defaults to 30 seconds without a consumed handoff. It **only notifies**;
   it does not interrupt or kill the delegate, close the pane or remove runtime files.
@@ -160,6 +178,20 @@ and the opencode client API to notify the owning session. No separate peer socke
   heartbeat exists) produces a possible-stall notification, not proof that the task has crashed.
   This applies only to bounded jobs. Interactive peers have no idle heartbeat alarm; their
   startup timeout checks for the conversation binding created by `read_task`.
+
+## Lifecycle Logs
+
+Redacted daily JSONL logs live at `$XDG_STATE_HOME/herdr-envoy/logs/YYYY-MM-DD.jsonl`, falling
+back to `~/.local/state/herdr-envoy/logs/` when `XDG_STATE_HOME` is unset or empty. Timestamps
+and filenames use UTC. Records contain only `time`, `jobId`, `event`, and optional `reason`,
+`generation`, `disposition` and `httpStatus`. No free-form text, paths, prompts, reports, tokens
+or exception messages are logged.
+
+Retention keeps today and the previous 29 UTC dates, independently of job cleanup. A soft
+8 MiB daily append cap can be exceeded by concurrent writers. Reconciliation failure logging
+is rate-limited to once per minute per job per process; reconciliation itself still runs every
+2 seconds. Logging failures never block operations. Existing jobs do not receive historical
+event backfill.
 
 ## Bounded Tools and Validation
 
@@ -225,6 +257,11 @@ Errors stop cleanup and retain the tracked job and progress for retry, including
 coordinator restart. A failed branch deletion may leave a job whose pane and checkout are already
 removed. Preserve work and resolve the refusal rather than forcing deletion. Restart recovery
 does not automatically retry reaping; call `reap_delegate` again when ready.
+
+For uncertain creation, cleanup first reconciles herdr worktree/workspace and Git inventories,
+including an older recorded parent that targeted the wrong repository. Clear uncertainty only
+when inventories and disk prove no checkout, workspace or branch remains and no launch was
+attempted. Surviving resources or inconclusive inventories keep cleanup refused for inspection.
 
 ## Shipped Guidance
 

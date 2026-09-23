@@ -34,6 +34,39 @@ export function sessionRoot(): string {
   return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "herdr-envoy", "sessions");
 }
 
+export async function withSessionLock<T>(jobId: string, action: () => Promise<T>, retries = 0): Promise<T> {
+  if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("Invalid session lock identity");
+  const locks = path.join(sessionRoot(), ".locks");
+  await fs.mkdir(locks, { recursive: true, mode: 0o700 });
+  const lock = path.join(locks, jobId);
+  let handle;
+  try {
+    handle = await fs.open(lock, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (retries > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return withSessionLock(jobId, action, retries - 1);
+    }
+    const pid = Number(await fs.readFile(lock, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Session lock is incomplete; inspect before recovery");
+    try { process.kill(pid, 0); }
+    catch (probe) {
+      if ((probe as NodeJS.ErrnoException).code !== "ESRCH") throw probe;
+      await fs.unlink(lock);
+      return withSessionLock(jobId, action);
+    }
+    throw new Error("Session is being updated by another coordinator; retry later");
+  }
+  try {
+    await handle.writeFile(String(process.pid));
+    return await action();
+  } finally {
+    await handle.close();
+    await fs.unlink(lock);
+  }
+}
+
 export interface Check {
   command: string;
   expectedExitCode: number;

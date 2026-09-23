@@ -4,6 +4,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { tool } from "@opencode-ai/plugin";
+import { lifecycle } from "./log.js";
 const z = tool.schema;
 import {
   PROTOCOL_VERSION,
@@ -11,6 +12,7 @@ import {
   atomicWriteJSON,
   exists,
   rand,
+  withSessionLock,
   readJSON,
   type Block,
   type Consumed,
@@ -152,7 +154,10 @@ export function readTaskTool(state: DelegateState) {
           `## Task\n${task}\n\n` +
           `## Current control\nStatus: ${session.status}. Generation: ${session.generation}.\n` +
           (session.status === "active" ? `Work with the user on their instructions.\n` :
-            `Do not continue work or submit another hand-back until the coordinator resumes this session.\n`) +
+            `Do not continue work until the coordinator resumes this session. ` +
+            (session.status === "paused" ?
+              `An explicit user instruction to commit or discard may be handed back without resuming.\n` :
+              `Ask the coordinator to resolve the existing hand-back or use \`open_session\` for further work.\n`)) +
           `Call \`read_task\` again to reread current control, especially after a resume.\n\n` +
           `## Hand-back\nDo not call \`complete\` or \`ask\`, or automatically report completion. ` +
           `Ask the user directly when you need guidance. Call \`hand_back\` only after the user explicitly ` +
@@ -193,6 +198,8 @@ export function handBackTool(state: DelegateState) {
     args,
     async execute(input, ctx) {
       const request = z.object(args).parse(input);
+      if (!state.consumed) throw new Error("peer-delegate: no interactive job auth");
+      return withSessionLock(state.consumed.jobId, async () => {
       const session = await readInteractiveSession(state, ctx?.sessionID);
       if (session.sessionID !== ctx.sessionID) {
         throw new Error("peer-delegate: call read_task to bind this interactive session first");
@@ -203,18 +210,23 @@ export function handBackTool(state: DelegateState) {
       const status = request.disposition === "pause" ? "paused" : request.disposition;
       const { summary, checks, risks, userInstruction } = request;
       if (session.status !== "active") {
-        if (session.handbackID && session.status === status && session.summary === summary &&
-            session.userInstruction === userInstruction &&
-            JSON.stringify(session.checks) === JSON.stringify(checks) &&
-            JSON.stringify(session.risks) === JSON.stringify(risks)) {
-          return `Hand-back already reported for job ${session.jobId} (generation ${session.generation}).`;
+        if (session.handbackID && session.status === status) {
+          await lifecycle(session.jobId, "handback_duplicate", { generation: session.generation, disposition: status });
+          return `Hand-back already reported for job ${session.jobId} (generation ${session.generation}, ` +
+            `disposition ${request.disposition}). The original report is unchanged; no new hand-back was published.`;
         }
-        throw new Error("peer-delegate: interactive session is not active");
+        if (session.status !== "paused") {
+          throw new Error(`peer-delegate: interactive session is ${session.status} ` +
+            `(generation ${session.generation}); cannot report ${request.disposition}. ` +
+            `Ask the coordinator to resolve the existing hand-back, resume commit-ready work, or use open_session for a new task.`);
+        }
       }
       await atomicWriteJSON(path.join(state.jobDir, FILES.session), {
         ...session, status, summary, checks, risks, userInstruction, handbackID: rand(),
       } satisfies InteractiveSession);
+      await lifecycle(session.jobId, "handback", { generation: session.generation, disposition: status });
       return `Reported ${request.disposition} hand-back for job ${session.jobId} (generation ${session.generation}).`;
+      }, 100);
     },
   });
 }

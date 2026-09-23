@@ -31,6 +31,7 @@ Choose lifecycle separately from placement:
 
 Before calling either creation tool, resolve these arguments:
 - \`agent\`: which of the USER'S OWN agents should do this (ask if unclear — do not invent one).
+  Repository-scoped validation supports \`primary\`, \`subagent\` and \`all\` modes.
 - \`task\`: complete, self-contained instructions (the delegate starts with no context).
 - \`repo\`: absolute path to the repository.
 - \`branch\`: a fresh branch name, e.g. \`delegate/<short-slug>\`.
@@ -51,6 +52,9 @@ For bounded \`delegate\` only:
 Pane placement uses \`<repo>/.herdr-envoy/worktrees/<job-id>/\`, not branch-derived paths.
 Subworkspace placement uses herdr \`worktree create/open --workspace\` against the recorded parent,
 tracking the returned child workspace and root pane. Let plugin tools manage these resources.
+Resolve the requested repository's parent with \`herdr worktree list --cwd <repo>\` and verify
+the same realpath repository root, even across repositories. If no parent exists, ask the user
+to open that repository in herdr. Never substitute the caller's workspace.
 \`coordinator.json\` persists session, project and pane ownership plus delivery/cleanup progress.
 Filesystem watches are wake hints backed by 2-second reconciliation. Bounded restart recovery requires
 the same project directory and \`HERDR_PANE_ID\`; legacy jobs without coordinator metadata cannot
@@ -62,12 +66,23 @@ Interactive records live at \`$XDG_STATE_HOME/herdr-envoy/sessions/<id>/\`, fall
 conversation ID and handback summary/checks/risks. Bounded runtime storage is unchanged.
 Interactive recovery is project-scoped without a coordinator-pane restriction, but retains the
 original orchestrator owner. \`list_sessions\` lists only that caller's project interactive
-sessions and their state/summary, never tokens.
+sessions with state, generation, summary, checks, risks, \`notificationPending\` and
+\`notificationAttemptedAt\` (the pending note's \`attemptedAt\`), never tokens.
 Use \`resume_session\` with optional instructions and an optional full ID or unique prefix of at
-least eight characters. Omit ID only for one eligible owned session. Never auto-select ambiguous
+least eight characters. An explicit ID resumes paused or commit-ready work regardless of pending
+delivery, returns the previous handback summary/checks/risks and durably supersedes its queued
+notice. It never commits or reaps; wait for a new handback before commit or cleanup. Discard cannot
+resume or implicitly resurrect. Omit ID only for exactly one paused owned session. Never auto-select ambiguous
 names or candidates. Resume requires the originating orchestrator \`sessionID\` and preserves
 conversation, checkout, branch and placement. Missing conversation, checkout or recorded parent
 means safe refusal, not a new session, replacement checkout or fallback placement.
+
+Durable redacted logs use \`$XDG_STATE_HOME/herdr-envoy/logs/YYYY-MM-DD.jsonl\` (fallback
+\`~/.local/state/herdr-envoy/logs/\`). Only UTC timestamps, job IDs, event/reason codes, generation,
+disposition and HTTP status are recorded, never text, paths or tokens. Keep today and the previous
+29 UTC dates, with a soft 8 MiB daily append cap allowing concurrent overshoot. Reconciliation
+failure logs are limited to once per minute per job per process. Logging failures do not block
+operations, and historical events are not backfilled.
 
 Call the chosen creation tool and tell the user it's running. For bounded completion, review it
 and report the outcome. Handling the follow-up depends on the note:
@@ -86,6 +101,11 @@ They may hand back ONLY on explicit user instruction, not when the initial task 
 - "discard this" means \`discard\`: record a request, then obtain explicit destructive user
   confirmation in the orchestrator. The request alone does not authorise removal.
 
+Explicit \`hand_back\` may move paused work to commit/discard without resuming. Same-disposition
+retries preserve the original report even with a different summary. Commit/discard cannot
+transition through \`hand_back\`; only explicit orchestrator resume can reopen commit-ready work.
+Coordinator operations and \`hand_back\` share per-session locks.
+
 Use \`reap_delegate\` only when eligible. Active or paused interactive sessions cannot be ordinarily
 reaped. Ordinary cleanup closes the pane or owned child workspace BEFORE non-force Git cleanup.
 Never close the parent workspace. Errors retain tracked state for retry. Optional \`deleteBranch\`
@@ -94,6 +114,9 @@ defaults to false and uses \`git branch -d\`, not \`-D\`; preserve work if Git r
 \`discard: true\` and \`confirmation\` equal to its EXACT FULL job ID after the user's explicit
 destructive confirmation. Never use this for a bounded, active or paused job. Reply/reap/resume
 and listing are caller-scoped. A failed review, check or commit must not trigger cleanup.
+Uncertain creation cleanup reconciles herdr/Git inventories, including an older wrong-parent
+repository. Clear uncertainty only with proof of no checkout, workspace, branch or attempted
+launch. Surviving resources or inconclusive inventories keep cleanup refused for inspection.
 
 For fan-out, call \`delegate\` multiple times (distinct branches) and reconcile as each completes.`,
 };

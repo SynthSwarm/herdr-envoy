@@ -37,6 +37,7 @@ durable interactive work. Neither lifecycle determines placement: both tools acc
 
 Resolve these creation arguments first:
 - \`agent\`: which of the USER'S OWN agents runs the task. Ask if unclear — never invent one.
+  Repository-scoped validation supports \`primary\`, \`subagent\` and \`all\` modes.
 - \`task\`: complete, self-contained instructions. The delegate starts with NO context, so include
   everything it needs. Do not reference files it can't see.
 - \`repo\`: absolute path to the repository.
@@ -60,6 +61,9 @@ Creation returns after launch setup, without waiting for completion. Tell the us
 **Do not block** waiting for it. Pane placement uses \`<repo>/.herdr-envoy/worktrees/<job-id>/\`.
 Subworkspace placement uses herdr \`worktree create/open --workspace\` against the recorded parent,
 tracking the returned child workspace, root pane and checkout. Do not guess resource identities.
+Resolve the requested repository's parent with \`herdr worktree list --cwd <repo>\` and verify
+the same realpath repository root, even across repositories. If no parent exists, ask the user
+to open that repository in herdr. Never substitute the caller's workspace.
 Both peers read the persisted brief with \`read_task\`, not the already-consumed \`handoff.json\`.
 Bounded peers report with \`complete\` and ask questions with \`ask\`. Interactive peers expose
 \`read_task\` and \`hand_back\` only, with NO \`complete\` or \`ask\`.
@@ -75,6 +79,13 @@ to \`~/.local/state/herdr-envoy/sessions/<id>/\`. It retains owner/project, cont
 generation, peer conversation ID, placement and handback summary/checks/risks. Bounded runtime
 storage is unaffected. Interactive recovery is project-scoped without a coordinator-pane
 restriction. The original orchestrator owner is retained, never reassigned to the discoverer.
+
+Durable redacted logs use \`$XDG_STATE_HOME/herdr-envoy/logs/YYYY-MM-DD.jsonl\` (fallback
+\`~/.local/state/herdr-envoy/logs/\`). Only UTC timestamps, job IDs, event/reason codes, generation,
+disposition and HTTP status are recorded, never text, paths or tokens. Keep today and the previous
+29 UTC dates, with a soft 8 MiB daily append cap allowing concurrent overshoot. Reconciliation
+failure logs are limited to once per minute per job per process. Logging failures do not block
+operations, and historical events are not backfilled.
 
 Notes use persisted stable message IDs, readback and retries, with delivery deferred while the
 owning session is busy. This is not an exactly-once delivery guarantee. Interpret notes as follows:
@@ -103,11 +114,20 @@ initial task, going idle or deciding the work looks ready is not a handback inst
   confirmation from the user in the orchestrator before removing work. The request is not consent.
 
 Handback includes summary, checks and risks. Use \`list_sessions\` to inspect durable interactive
-sessions for the current project owned by the calling orchestrator \`sessionID\`, with state and
-summary but no tokens. Recovery does not broaden listing scope.
+sessions for the current project owned by the calling orchestrator \`sessionID\`, with state,
+generation, summary, checks, risks, \`notificationPending\` and \`notificationAttemptedAt\`
+(the pending note's \`attemptedAt\`) but no tokens. Recovery does not broaden listing scope.
+
+Explicit \`hand_back\` may move paused work to commit/discard without resuming. Same-disposition
+retries preserve the original report even with a different summary. Commit/discard cannot
+transition through \`hand_back\`; only explicit orchestrator resume can reopen commit-ready work.
+Coordinator operations and \`hand_back\` share per-session locks.
 
 \`resume_session\` takes optional instructions and an optional full ID or unique prefix of at
-least eight characters. Omit ID only when exactly one eligible owned session exists. Do not
+least eight characters. An explicit ID resumes paused or commit-ready work regardless of pending
+delivery, returns the previous handback summary/checks/risks and durably supersedes its queued
+notice. It never commits or reaps; wait for a new handback before commit or cleanup. Discard cannot
+resume or implicitly resurrect. Omit ID only when exactly one paused owned session exists. Do not
 auto-select an ambiguous name or candidate. Resume requires the originating orchestrator
 \`sessionID\` and continues the same peer conversation, worktree, branch and placement.
 Missing conversation, checkout or recorded parent workspace must cause a safe refusal, not a
@@ -129,6 +149,9 @@ EXACT FULL job ID. A prefix, name or generic approval is insufficient. Never for
 bounded, active or paused job. Branch deletion is a separate choice, not implied by discard.
 Reply/reap/resume and listing are caller-scoped. Launch failures attempt safe cleanup and retain
 the job if cleanup fails. Neither placement grants permission to discard work.
+Uncertain creation cleanup reconciles herdr/Git inventories, including an older wrong-parent
+repository. Clear uncertainty only with proof of no checkout, workspace, branch or attempted
+launch. Surviving resources or inconclusive inventories keep cleanup refused for inspection.
 
 ## Fan-out
 For multiple independent workstreams, call \`delegate\` several times (distinct branches) and

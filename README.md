@@ -60,7 +60,7 @@ opencode to load the changes.
 
 | Argument | Contract |
 | --- | --- |
-| `agent` | Name of one of your own agents, validated in the source repo's scope. |
+| `agent` | Name of one of your own agents, validated in the source repo's scope. `primary`, `subagent` and `all` modes are supported. |
 | `task` | Complete instructions, persisted for the delegate to read. |
 | `repo` | Absolute path to the source repo. |
 | `branch` | Fresh branch name, e.g. `delegate/foo`. Existing branches are rejected. |
@@ -79,11 +79,16 @@ context's `sessionID`. Notes target that session, with delivery deferred while i
   `targetBranch`, and `placement` (`pane` by default, or `subworkspace`). Agent, repository and
   fresh-branch validation match `delegate`. The name is a display label, not a unique identity.
 - **`list_sessions`** lists durable interactive sessions for this project owned by the calling
-  orchestrator `sessionID`, including their IDs, state and handback summary. It exposes no tokens.
+  orchestrator `sessionID`, including their IDs, state, generation, handback summary, checks, risks,
+  `notificationPending` and `notificationAttemptedAt` (the pending note's `attemptedAt`). It exposes no tokens.
 - **`resume_session`** resumes the same interactive conversation, worktree, branch and placement,
   with optional instructions and an optional full ID or unique prefix (at least eight characters).
   It requires the originating orchestrator `sessionID`. Omit the ID only when there is exactly
-  one eligible session. Ambiguous names or candidates must not be auto-selected. A missing
+  one paused session. An explicit ID can resume paused or commit-ready work without waiting for
+  notification delivery. It returns the previous handback summary, checks and risks, durably
+  supersedes the old queued notice and does not commit or reap. Wait for a new handback before
+  commit or cleanup. Discard-requested sessions cannot resume.
+  Ambiguous names or candidates must not be auto-selected. A missing
   conversation, checkout or recorded parent workspace causes a safe refusal, not a new session,
   replacement worktree or fallback placement.
 - **`reap_delegate`** explicitly closes the owned pane or child workspace before Git cleanup.
@@ -120,6 +125,10 @@ going idle or deciding the work looks done is not permission to hand back.
 
 Handback records a summary, checks and risks. The interactive peer does not commit or clean up
 merely because it hands back. Reply/reap/resume and listing remain scoped to the calling owner.
+An explicit `hand_back` can move paused work to `commit` or `discard` without resuming first.
+Same-disposition retries preserve the original report, even if the supplied summary differs.
+Commit/discard handbacks cannot change disposition through `hand_back`; only the orchestrator
+can explicitly resume commit-ready work. Discard never implicitly resurrects a session.
 
 ## How it works
 
@@ -141,12 +150,22 @@ merely because it hands back. Reply/reap/resume and listing remain scoped to the
   Durable metadata is not a backup of the conversation or checkout. Missing resources are
    reported and preserved for repair, never silently replaced.
 - **Uncertain operations.** A partial workspace creation or uncertain interactive launch retains
-  metadata and resources for inspection instead of deleting them. Per-session coordinator locks
-  prevent concurrent updates. An incomplete lock requires inspection; a confirmed dead owner can
+  metadata and resources for inspection instead of deleting them. Cleanup reconciles herdr/Git
+  inventories, including an older wrong-parent repository, and clears creation uncertainty only
+  when no checkout, workspace or branch remains and no launch was attempted. Surviving resources keep
+  cleanup refused for inspection. Per-session locks shared by coordinator operations and
+  `hand_back` prevent concurrent updates. An incomplete lock requires inspection; a confirmed dead owner can
   be recovered. Interrupted resumes retain their generation and can be retried with the full ID.
 - **Notifications.** Pending notes have persisted stable message IDs, readback and retries.
   Delivery is deferred while the owning session is busy; toasts are best-effort. This is not an
   exactly-once delivery guarantee. A stale heartbeat indicates a possible stall, not proof of a crash.
+- **Lifecycle logs.** Durable redacted logs live at
+  `$XDG_STATE_HOME/herdr-envoy/logs/YYYY-MM-DD.jsonl` (fallback
+  `~/.local/state/herdr-envoy/logs/`). Records contain only UTC timestamps, job IDs, event/reason
+  codes, generation, disposition and HTTP status, never free text, paths or tokens. Retention is
+  today plus the previous 29 UTC dates. The daily append cap is a soft 8 MiB, allowing concurrent
+  overshoot. Reconciliation failure logging is limited to once per minute per job per process.
+  Logging failures do not block operations, and historical events are not backfilled.
 - **Validation, not approval.** Reports are checked for identity and contract. Successful
   code-change reports also get basic Git checks: clean tree, at least one commit past the assigned
   base, head reachable from the assigned branch, base ancestry and a limited protocol-artifact
@@ -154,7 +173,9 @@ merely because it hands back. Reply/reap/resume and listing remain scoped to the
   trusted. Review code changes, run required checks and obtain user approval before merging.
 - **Placement.** `pane` uses plain Git at `<repo>/.herdr-envoy/worktrees/<job-id>/` and a split
   pane in the current workspace. `subworkspace` uses `herdr worktree create/open --workspace`
-  with the recorded parent workspace and records the returned child workspace and root pane.
+  with the requested repository's parent, found through `herdr worktree list --cwd <repo>` and
+  verified against the same realpath repository root, not the caller's workspace. If no parent
+  exists, open that repository in herdr first. It records the returned child workspace and root pane.
   Cleanup closes that owned child workspace before non-force Git cleanup, not the parent.
 - **Explicit cleanup.** Bounded completion keeps the pane/workspace, checkout and result for
   inspection. Interactive pause preserves everything. Launch failures attempt safe cleanup,

@@ -12,6 +12,12 @@ const request = { disposition: "pause", summary: "Implementation ready for revie
 
 async function fixture(t) {
   const jobDir = await fs.mkdtemp(path.join(os.tmpdir(), "envoy-interactive-delegate-"));
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = path.join(jobDir, "state");
+  t.after(() => {
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
+  });
   t.after(() => fs.rm(jobDir, { recursive: true, force: true }));
   const file = (name) => path.join(jobDir, FILES[name]);
   const session = {
@@ -82,7 +88,7 @@ test("pause and coordinator resume use fresh control and a new generation", asyn
 });
 
 for (const disposition of ["pause", "commit", "discard"]) {
-  test(`${disposition} publishes atomically and identical retries never republish`, async (t) => {
+  test(`${disposition} publishes atomically and same-disposition retries preserve the original report`, async (t) => {
     const f = await fixture(t);
     await readTaskTool(f.state).execute({}, ctx);
     const before = await f.read();
@@ -106,13 +112,98 @@ for (const disposition of ["pause", "commit", "discard"]) {
     assert.deepEqual(await f.read(), published);
     for (const changed of [
       { summary: "Changed" }, { checks: [] }, { risks: [] }, { userInstruction: "Different instruction" },
-      { disposition: disposition === "pause" ? "commit" : "pause" },
+      { summary: "Changed", checks: ["Different checks"], risks: ["Different risks"], userInstruction: "Repeat hand-back" },
     ]) {
-      await assert.rejects(handBackTool(f.state).execute({ ...args, ...changed }, ctx), /not active/);
+      const text = await handBackTool(f.state).execute({ ...args, ...changed }, ctx);
+      assert.match(text, /already reported/);
+      assert.ok(text.includes(`job ${published.jobId} (generation ${published.generation}, disposition ${disposition})`));
+      assert.match(text, /original report is unchanged/);
+      assert.deepEqual(await f.read(), published);
     }
     assert.equal(publish.mock.callCount(), 1);
-    assert.deepEqual((await fs.readdir(f.jobDir)).sort(), [FILES.consumed, FILES.session].sort());
+    assert.deepEqual((await fs.readdir(f.jobDir)).sort(), [FILES.consumed, FILES.session, "state"].sort());
     if (process.platform !== "win32") assert.equal((await fs.stat(f.file("session"))).mode & 0o777, 0o600);
+  });
+}
+
+for (const disposition of ["commit", "discard"]) {
+  test(`paused sessions can explicitly request ${disposition} without resuming`, async (t) => {
+    const f = await fixture(t);
+    const readTask = readTaskTool(f.state);
+    const handBack = handBackTool(f.state);
+    await readTask.execute({}, ctx);
+    await handBack.execute(request, ctx);
+    const paused = await f.read();
+    const guidance = await readTask.execute({}, ctx);
+    assert.match(guidance, /Do not continue work until the coordinator resumes/);
+    assert.match(guidance, /commit or discard may be handed back without resuming/);
+    const rename = fs.rename;
+    const publish = t.mock.method(fs, "rename", async (source, dest) => {
+      assert.equal(dest, f.file("session"));
+      assert.deepEqual(await f.read(), paused, "the session must never be reactivated");
+      await rename(source, dest);
+    });
+    const args = { disposition, summary: "Updated report", checks: ["Tests passed"], risks: [],
+      userInstruction: `Please ${disposition} instead.` };
+    assert.match(await handBack.execute(args, ctx), new RegExp(`Reported ${disposition}`));
+    const published = await f.read();
+    assert.deepEqual(published, { ...paused, status: disposition, summary: args.summary,
+      checks: args.checks, risks: args.risks, userInstruction: args.userInstruction,
+      handbackID: published.handbackID });
+    assert.notEqual(published.handbackID, paused.handbackID);
+    assert.equal(publish.mock.callCount(), 1);
+    assert.equal(f.state.interactiveGeneration, paused.generation);
+    assert.match(await readTask.execute({}, ctx), /resolve the existing hand-back.*open_session/);
+  });
+
+  test(`${disposition} rejects other dispositions with current state and recovery instructions`, async (t) => {
+    const f = await fixture(t);
+    await readTaskTool(f.state).execute({}, ctx);
+    const handBack = handBackTool(f.state);
+    await handBack.execute({ ...request, disposition }, ctx);
+    const published = await f.read();
+    const publish = t.mock.method(fs, "rename");
+    for (const next of ["pause", disposition === "commit" ? "discard" : "commit"]) {
+      await assert.rejects(handBack.execute({ ...request, disposition: next }, ctx),
+        new RegExp(`session is ${disposition} \\(generation 1\\); cannot report ${next}.*resolve the existing hand-back.*open_session`));
+    }
+    assert.equal(publish.mock.callCount(), 0);
+    assert.deepEqual(await f.read(), published);
+  });
+}
+
+for (const disposition of ["pause", "commit", "discard"]) {
+  test(`inactive ${disposition} requests still require auth, binding, generation and user instruction`, async (t) => {
+    const f = await fixture(t);
+    await readTaskTool(f.state).execute({}, ctx);
+    const handBack = handBackTool(f.state);
+    for (const prior of ["pause", "commit", "discard"]) {
+      await f.write({ ...f.session, sessionID: ctx.sessionID });
+      await handBack.execute({ ...request, disposition: prior }, ctx);
+      const published = await f.read();
+      const args = { ...request, disposition };
+      for (const consumed of [null, { ...f.state.consumed, mode: undefined }]) {
+        await assert.rejects(handBackTool({ ...f.state, consumed }).execute(args, ctx), /no interactive job auth/);
+      }
+      await assert.rejects(handBack.execute(args), /ctx.sessionID/);
+      await assert.rejects(handBack.execute(args, { sessionID: "other" }), /another sessionID/);
+      for (const userInstruction of [undefined, "", "   "]) {
+        await assert.rejects(handBack.execute({ ...args, userInstruction }, ctx), /userInstruction/);
+      }
+      assert.deepEqual(await f.read(), published);
+      for (const [change, error] of [
+        [{ sessionID: undefined }, /call read_task/],
+        [{ completionToken: "other-token" }, /identity mismatch/],
+        [{ generation: 0 }, /generation mismatch/],
+        [{ generation: 2 }, /generation changed/],
+      ]) {
+        const changed = { ...published, ...change };
+        await f.write(changed);
+        const before = await f.read();
+        await assert.rejects(handBack.execute(args, ctx), error);
+        assert.deepEqual(await f.read(), before);
+      }
+    }
   });
 }
 
@@ -162,7 +253,7 @@ test("hand_back rechecks binding and inactive control even for identical retries
   const handBack = handBackTool(f.state);
   await assert.rejects(handBack.execute(request, { sessionID: "another-caller" }), /another sessionID/);
   await f.write({ ...await f.read(), status: "paused" });
-  await assert.rejects(handBack.execute(request, ctx), /not active/);
+  assert.match(await handBack.execute(request, ctx), /Reported pause/);
   await f.write({ ...await f.read(), status: "active" });
   await handBack.execute(request, ctx);
   const paused = await f.read();
