@@ -1,7 +1,7 @@
 {
   "name": "herdr-envoy",
   "version": "0.1.0",
-  "description": "opencode plugin: dispatch bounded tasks to real peer opencode agents (envoys) running in their own git worktrees, spawned as split panes in herdr. Disk is the transport, file-watches are the events. The coordinator auto-verifies and optionally auto-merges. Ships the delegation tooling, an /envoy command, and a self-provisioned skill — your agents stay yours.",
+  "description": "opencode plugin for bounded tasks and durable interactive peer sessions in isolated git worktrees, using herdr panes or child workspaces. Ships delegation tools, an /envoy command and coordinator guidance, with explicit handback and cleanup.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -42,7 +42,7 @@
     "test": "npm run build && node --test test/*.test.mjs",
     "test:bun": "npm run build && bun test test/bun-shell.test.ts",
     "test:coverage": "npm run build && node --test --experimental-test-coverage --test-coverage-include='dist/*.js' --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=95 test/*.test.mjs",
-    "prepublishOnly": "npm run build"
+    "prepack": "npm run build"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.17.0"

@@ -3,11 +3,11 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "peer-delegate",
+      "name": "herdr-envoy",
       "devDependencies": {
         "@opencode-ai/plugin": "^1.18.4",
         "@types/node": "^26.1.1",
-        "typescript": "5",
+        "typescript": "^5.6.0",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.17.0",
