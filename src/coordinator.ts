@@ -21,6 +21,7 @@ import {
   root,
   sessionRoot,
   withSessionLock,
+  SessionLockBusyError,
   type InteractiveSession,
   type Placement,
   type Consumed,
@@ -647,6 +648,8 @@ export class Coordinator {
       const heartbeat = await stat(path.join(dir, FILES.heartbeat)).catch(() => stat(path.join(dir, FILES.consumed)));
       if (Date.now() - heartbeat.mtimeMs > 30_000 && !job.delivered.includes("stalled")) await this.notifyStalled(jobId);
     }).catch(async (error) => {
+      // Handback publication can wake the watcher before the delegate releases its lock.
+      if (error instanceof SessionLockBusyError) return;
       if (Date.now() - (this.failureLog.get(jobId) ?? -Infinity) >= 60_000) {
         this.failureLog.set(jobId, Date.now());
         await lifecycle(jobId, "reconciliation_failed", { reason: "state" });

@@ -1142,6 +1142,38 @@ test("a startup-timeout notice stays pending across busy scans and delivers once
   assert.equal(f.posts.length, 1);
 });
 
+test("background lock contention is quiet and retries delivery without hiding subsequent state failures", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  f.options.busy = true;
+  const paused = await f.handBack(job);
+  const pending = (await f.metadata(job)).pending;
+  const errors = t.mock.method(console, "error", () => {});
+  const logCount = (await f.logs()).length;
+  f.options.busy = false;
+
+  await withSessionLock(job.jobId, async () => {
+    await f.settle(job);
+    assert.equal(errors.mock.callCount(), 0);
+    assert.equal((await f.logs()).length, logCount);
+    assert.deepEqual((await f.metadata(job)).pending, pending);
+    assert.equal(f.posts.length, 0);
+  });
+
+  // Contention must not consume the genuine failure log's rate-limit window.
+  await atomicWriteJSON(path.join(job.jobDir, FILES.session), { ...paused, completionToken: "invalid-token" });
+  await f.settle(job);
+  assert.equal(errors.mock.callCount(), 1);
+  assert.equal((await f.logs()).slice(logCount).filter((record) => record.event === "reconciliation_failed").length, 1);
+
+  await atomicWriteJSON(path.join(job.jobDir, FILES.session), paused);
+  await f.settle(job);
+  assert.equal(f.posts.length, 1);
+  assert.equal((await f.metadata(job)).pending, undefined);
+  assert.deepEqual((await f.metadata(job)).delivered, [`handback:${paused.handbackID}`]);
+  assert.deepEqual(await f.state(job), paused);
+});
+
 test("reconciliation failures log at most once per job per minute while scans keep retrying", async (t) => {
   const f = await fixture(t);
   const job = await f.open({ startupTimeoutSeconds: 120 });

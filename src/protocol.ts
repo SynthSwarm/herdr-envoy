@@ -34,6 +34,8 @@ export function sessionRoot(): string {
   return path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "herdr-envoy", "sessions");
 }
 
+export class SessionLockBusyError extends Error {}
+
 export async function withSessionLock<T>(jobId: string, action: () => Promise<T>, retries = 0): Promise<T> {
   if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("Invalid session lock identity");
   const locks = path.join(sessionRoot(), ".locks");
@@ -56,7 +58,7 @@ export async function withSessionLock<T>(jobId: string, action: () => Promise<T>
       await fs.unlink(lock);
       return withSessionLock(jobId, action);
     }
-    throw new Error("Session is being updated by another coordinator; retry later");
+    throw new SessionLockBusyError("Session is being updated by another coordinator; retry later");
   }
   try {
     await handle.writeFile(String(process.pid));
