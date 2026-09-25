@@ -56,6 +56,52 @@ opencode to load the changes.
 
 ### Coordinator tools (in your normal sessions)
 
+**`list_machines`** is read-only discovery, with no arguments. It lists Local (the calling
+herdr session, `id: null`) and saved SSH machines, including each machine's live OpenCode
+agents, pane/workspace IDs, name when available, state, working directory, terminal title and
+conversation ID when reported. "Live" includes idle, working, blocked, done and unknown states,
+not just agents currently generating a response. These are running instances, not configured
+OpenCode agent personas or Envoy-owned sessions.
+
+Discovery requires `HERDR_ENV=1` and herdr's machine forwarding support (0.9.1). It uses
+`herdr machine list --json`, local `herdr agent list`, and `herdr --machine <id> agent list`
+for each enabled saved profile. Each command has a 15-second timeout. Disabled machines are
+not contacted. Failed queries return `status: "unavailable"` with `agents: null`, distinct from
+a successful empty list. If profile discovery fails, Local is still inspected and a top-level
+error reports the incomplete inventory. No server is installed/started and no agent is prompted
+or claimed. IDs are scoped to the containing machine and its configured session. Existing
+delegation/resume tools remain local; discovery does not enable remote delegation.
+
+**`request_agent({paneId, sessionId, task})`** queues a request for an existing **local** OpenCode agent.
+Select the pane and expected conversation ID from Local discovery, never a remote machine. Both
+coordinator and recipient must have this plugin version loaded under the same user's state
+directory. It records the exact herdr socket, terminal, pane, conversation and working directory.
+It creates no worktree, changes no branch, sends no terminal input and takes no ownership of
+the recipient's resources. The recipient polls its persisted inbox every two seconds, waits for
+herdr idle/done and OpenCode idle, and submits through its own OpenCode client with the existing
+persona/model. One outstanding request per conversation waits for explicit handback before the
+next is delivered. Requests for missing/replaced panes or conversations stay queued.
+
+The recipient calls `read_task({jobId})` and `hand_back({jobId, disposition, summary, checks,
+risks, userInstruction})`. Handback still requires the user's explicit direction, not automatic
+completion. Omitting `jobId` retains the original delegation's tool behaviour. Ordinary OpenCode
+sessions now expose these tools too. `list_sessions` includes `existingAgent`, `requestDelivered`,
+`requestAttemptedAt` and `requestCancelled` for the owner's requests. Handbacks notify the original
+coordinator, but never authorise cleanup or committing unrelated work. `resume_session` and
+`reap_delegate` refuse existing-agent requests.
+
+`cancel_request({jobId})` retires an owner's request from the delivery queue without touching
+the target's resources or interrupting/retracting work already submitted. A failed or uncertain
+submission is retained, read back, and never blindly resubmitted. If it cannot be confirmed,
+inspect the target before cancelling and sending a replacement. Queue and report state survive
+process restarts. There is no automatic timeout or remote delivery.
+
+**Limitation:** idle checking and submission are not atomic in OpenCode's legacy API. A concurrent
+user submission can race the last idle check. This is best-effort non-interrupting delivery, not
+an execution reservation. It never aborts the existing turn. The v2 queue API is deliberately
+not used because OpenCode 1.18.27 runs it through a separate execution loop from legacy TUI
+sessions. Restart both coordinator and target to enable these tools after installing an update.
+
 **`delegate`** spawns a peer agent on a task:
 
 | Argument | Contract |
@@ -114,6 +160,8 @@ Bounded delegates consume their brief and expose:
 - **`ask`** — ask the coordinator a question and block until answered.
 
 Interactive delegates expose **only `read_task` and `hand_back`**, not `complete` or `ask`.
+Bounded delegates also expose `hand_back` for a separately addressed existing-agent request,
+not for their original bounded job. Both read/handback tools accept the optional request `jobId`.
 They remain interactive until the user explicitly instructs handback. Finishing an initial task,
 going idle or deciding the work looks done is not permission to hand back.
 

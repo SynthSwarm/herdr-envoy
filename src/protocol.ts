@@ -50,7 +50,10 @@ export async function withSessionLock<T>(jobId: string, action: () => Promise<T>
       await new Promise((resolve) => setTimeout(resolve, 50));
       return withSessionLock(jobId, action, retries - 1);
     }
-    const pid = Number(await fs.readFile(lock, "utf8"));
+    const pid = Number(await fs.readFile(lock, "utf8").catch((readError) => {
+      if (readError.code === "ENOENT") throw new SessionLockBusyError("Session lock was released during inspection; retry later");
+      throw readError;
+    }));
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Session lock is incomplete; inspect before recovery");
     try { process.kill(pid, 0); }
     catch (probe) {

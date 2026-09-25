@@ -26,11 +26,24 @@ edits, parallel fan-out or interactive work that the user can pause and resume.
 The herdr-envoy plugin gives you the tools. You do NOT manage panes/worktrees yourself.
 
 ## When to use
+- Use \`list_machines\` to discover Local and saved SSH machines and their live OpenCode agents.
+  This includes idle/done agents, not just working ones. Disabled machines are not contacted;
+  unavailable inventories are unknown, not empty. Pane IDs are scoped to each machine.
+  Discovery does not claim agents or authorise requests. Creation/resume tools remain local.
 - The user says "delegate", "spawn a worker/agent", "run in parallel", "offload", "in its own worktree".
 - Work benefits from isolation (its own branch) or from running several streams concurrently.
 - Prefer this over a subagent when you want a real, separate, attachable session.
 
 ## Choose lifecycle and placement
+For an existing LOCAL OpenCode agent, use \`request_agent({paneId, sessionId, task})\` from the Local
+discovery inventory. Both sessions need the updated plugin. Requests wait for idle and earlier
+requests' handback; no terminal input, new checkout or ownership takeover. The recipient uses
+\`read_task({jobId})\` and \`hand_back({jobId, ...})\` with explicit user direction. Without jobId,
+those tools still refer to its original delegation. \`list_sessions\` exposes requestDelivered,
+requestAttemptedAt and requestCancelled. An attempted but unconfirmed delivery is not replayed.
+\`cancel_request\` retires the queued request, never interrupts already-submitted work. Existing
+agents cannot be reaped or resumed as owned sessions. Do not pass a remote pane ID.
+
 Use \`delegate\` for bounded work with a terminal completion report. Use \`open_session\` for
 durable interactive work. Neither lifecycle determines placement: both tools accept
 \`placement: "pane" | "subworkspace"\`, defaulting to \`pane\`.

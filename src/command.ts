@@ -16,6 +16,20 @@ The user wants the following peer work:
 
 $ARGUMENTS
 
+Use \`list_machines\` for read-only discovery of Local and saved SSH machines and their live
+OpenCode agents. Idle/done agents are included, not just working ones. Disabled machines are
+not contacted; unavailable inventories are unknown, not empty. Pane IDs are machine-scoped.
+Discovery does not claim agents or authorise sending requests. Creation/resume tools remain local.
+
+Use \`request_agent({paneId, sessionId, task})\` for an existing LOCAL OpenCode agent, using the Local
+inventory from \`list_machines\`. Both processes need the updated plugin. Requests wait for idle
+and earlier requests' explicit handback. No terminal input, new checkout or ownership takeover.
+The target uses \`read_task({jobId})\` and \`hand_back({jobId, ...})\`; omit jobId only for its
+original delegation. Handback still requires explicit user direction, never inferred completion.
+Inspect \`list_sessions\` for requestDelivered/requestAttemptedAt/requestCancelled. An attempted
+but unconfirmed delivery is not automatically replayed. \`cancel_request\` retires a request
+without interrupting already-submitted work. Never reap/resume an existing-agent request.
+
 Choose lifecycle separately from placement:
 
 - Use \`delegate\` for a bounded task with a terminal report. Use \`open_session\` for durable,

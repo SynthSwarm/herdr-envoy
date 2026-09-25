@@ -9,10 +9,31 @@ handback is user-directed, with review, checks and commit before commit-disposit
 
 ## Roles and Ownership
 
+- `list_machines` discovers Local and saved SSH profiles with live OpenCode agents. Disabled
+  profiles are not contacted, unavailable inventories are not empty, and IDs are machine-scoped.
+- `request_agent({paneId, sessionId, task})` queues a request to an existing local OpenCode
+  conversation. It validates the expected conversation, pins socket/terminal/pane/directory,
+  and persists the brief and interactive control in the durable session root. It does not
+  create or own a checkout, branch, pane or conversation. Both processes need the updated plugin.
+- The recipient's plugin polls its inbox, serialises delivery per pane, and submits only after
+  herdr idle/done and OpenCode idle checks, preserving the prior user message's persona/model.
+  One request remains outstanding until explicit handback. Idle checking and legacy API
+  submission are not atomic against concurrent user input. No abort or terminal input is used.
+- All roles expose request-aware `read_task({jobId})` and `hand_back({jobId, ...})`. Omitting
+  jobId still refers to the original startup delegation, if any. Handback is user-directed and
+  reports only the request, never ownership of unrelated work. Existing-agent requests refuse
+  `resume_session` and `reap_delegate`. `cancel_request({jobId})` is owner-scoped queue retirement,
+  not an interrupt or retraction of already-submitted work.
+- `list_sessions` exposes delivery, attempted-submission and cancellation fields for requests.
+  Ambiguous submission is recovered by message read-back, never blindly replayed. If no receipt
+  can be confirmed, the owner must inspect and cancel before issuing a replacement. Queue state
+  survives restarts but does not retarget closed/replaced terminals or remote machines.
+
 - The coordinator exposes `delegate`, `open_session`, `list_sessions`, `resume_session`,
   `reply_delegate` and `reap_delegate`. A peer consumes the brief identified by
   `PEER_DELEGATE_JOBDIR`. Bounded peers expose `read_task`, `complete` and `ask`. Interactive
-  peers expose `read_task` and `hand_back`, with no `complete` or `ask` tools.
+  peers expose `read_task` and `hand_back`, with no `complete` or `ask` tools. Bounded peers also
+  expose `hand_back` for separately addressed existing-agent requests, not their bounded job.
 - Creation binds the job to its tool context's originating orchestrator `sessionID`, not
   whichever session is active later. Reply/reap/resume only resolve owned jobs, using the full
   job ID or a unique prefix of at least eight characters. Listing is also caller-scoped.

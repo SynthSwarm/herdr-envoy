@@ -60,6 +60,7 @@ interface Job {
   launchAttempted?: boolean;
   resourceUncertain?: boolean;
   resuming?: { generation: number; instructions?: string };
+  existing?: { sessionID: string; messageID: string; socket: string; terminalID: string; delivered?: boolean; attemptedAt?: number; cancelled?: boolean };
 }
 
 export class Coordinator {
@@ -349,10 +350,12 @@ export class Coordinator {
 
   async listSessions(sessionID: string): Promise<string> {
     const sessions = [];
-    for (const job of this.jobs.values()) {
+    for (let job of this.jobs.values()) {
       if (job.mode !== "interactive" || job.sessionID !== sessionID) continue;
+      if (job.existing) job = await readJSON<Job>(path.join(this.dir(job.jobId), FILES.coordinator));
       const state = await this.readSession(job);
       sessions.push({ jobId: job.jobId, name: job.name, status: state.status, phase: job.phase,
+        ...(job.existing ? { existingAgent: true, requestDelivered: Boolean(job.existing.delivered), requestAttemptedAt: job.existing.attemptedAt, requestCancelled: Boolean(job.existing.cancelled) } : {}),
         placement: job.placement, worktree: job.worktree, branch: job.branch,
         pane: job.pane, workspace: job.workspace, sessionID: state.sessionID, summary: state.summary,
         generation: state.generation, checks: state.checks, risks: state.risks,
@@ -390,6 +393,7 @@ export class Coordinator {
   private async resume(jobId: string, instructions?: string): Promise<string> {
     const job = this.jobs.get(jobId);
     if (!job || job.mode !== "interactive" || job.phase === "cleanup") throw new Error("No resumable interactive session");
+    if (job.existing) throw new Error("Existing-agent requests cannot be resumed as owned sessions. Send a new request instead.");
     const state = await this.readSession(job);
     if (!["paused", "commit"].includes(state.status) && !(job.resuming && state.status === "active")) {
       throw new Error(`Only paused or commit-ready sessions can be resumed; current state: ${state.status}`);
@@ -480,6 +484,7 @@ export class Coordinator {
     const $ = this.$;
     const job = this.jobs.get(jobId);
     if (!job) return;
+    if (job.existing) throw new Error("Existing agents and their checkouts are not owned by Envoy and cannot be reaped.");
     if (this.resumes.has(jobId)) throw new Error("Session is being resumed; retry cleanup afterwards");
     if (job.resourceUncertain) await this.reconcileCreation(job);
     if (opts.keepPane) throw new Error("Cannot remove a checkout while retaining its delegate pane");
@@ -611,6 +616,7 @@ export class Coordinator {
       const dir = this.dir(jobId);
       if (job.mode === "interactive") {
         const session = await this.readSession(job);
+        if (job.existing && !job.existing.delivered) return;
         if (job.resuming && session.status === "active") return;
         if (job.resuming) {
           job.resuming = undefined;
@@ -618,7 +624,9 @@ export class Coordinator {
         }
         if (session.status !== "active" && session.handbackID) {
           const key = `handback:${session.handbackID}`;
-          const instruction = session.status === "paused"
+          const instruction = job.existing
+            ? `EXISTING-AGENT HAND-BACK (${session.status}). This report concerns only the queued request. The existing conversation, pane and checkout are not owned by Envoy. Do not reap, resume, commit or discard unrelated work.`
+            : session.status === "paused"
             ? "PAUSED. Preserve the conversation, checkout and branch. Do not commit, merge or reap. Use resume_session to continue."
             : session.status === "commit"
               ? "READY FOR COMMIT. Review the diff and run checks, then commit in the worktree BEFORE reap_delegate. No merge or push is authorised."
@@ -658,6 +666,56 @@ export class Coordinator {
     }).finally(() => this.scans.delete(jobId));
     this.scans.set(jobId, scan);
     return scan;
+  }
+
+  async cancelRequest(jobId: string, owner: string): Promise<string> {
+    if (!this.jobs.get(jobId)?.existing || this.jobs.get(jobId)?.sessionID !== owner) throw new Error("No existing-agent request owned by this coordinator");
+    return this.exclusive(jobId, async () => {
+      const job = this.jobs.get(jobId)!;
+      job.existing!.cancelled = true;
+      await this.save(job);
+      return "Request retired from the delivery queue. Already-submitted work is NOT interrupted or retracted. The agent, conversation and checkout are unchanged.";
+    });
+  }
+
+  async requestAgent(paneId: string, task: string, owner: string, targetSessionID: string): Promise<string> {
+    if (!process.env.HERDR_PANE_ID || !process.env.HERDR_SOCKET_PATH || !owner || !task.trim()) throw new Error("A local herdr pane/socket, owner and nonblank task are required");
+    const inventory = JSON.parse(await this.$`herdr agent list`.text()).result?.agents;
+    if (!Array.isArray(inventory)) throw new Error("Cannot inspect local agents");
+    const matches = inventory.filter((pane) => pane.pane_id === paneId);
+    const pane = matches[0];
+    if (matches.length !== 1 || pane.agent !== "opencode" || pane.agent_session?.agent !== "opencode" ||
+        pane.agent_session.kind !== "id" || !targetSessionID || pane.agent_session.value !== targetSessionID || !pane.terminal_id || !path.isAbsolute(pane.cwd ?? "")) {
+      throw new Error("Target must be a live local OpenCode pane with a reported conversation ID and absolute working directory");
+    }
+    if (paneId === process.env.HERDR_PANE_ID || pane.agent_session.value === owner) throw new Error("Cannot queue a request to the coordinator itself");
+    const jobId = rand();
+    const dir = path.join(sessionRoot(), jobId);
+    const handoff: Handoff = {
+      protocolVersion: PROTOCOL_VERSION, jobId, generation: 1, completionToken: rand(),
+      agent: "opencode", task, outputContract: "advisory", targetBranch: "", baseCommit: "",
+      mergePolicy: "manual", checks: [], startupTimeoutSeconds: 30, mode: "interactive",
+    };
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    await atomicWriteJSON(path.join(dir, FILES.handoff), handoff);
+    await atomicWriteJSON(path.join(dir, FILES.session), {
+      protocolVersion: PROTOCOL_VERSION, jobId, generation: 1, completionToken: handoff.completionToken,
+      sessionID: pane.agent_session.value, status: "active",
+    } satisfies InteractiveSession);
+    const job: Job = {
+      jobId, directory: this.directory, coordinatorPane: process.env.HERDR_PANE_ID, sessionID: owner,
+      agent: "opencode", pane: paneId, worktree: pane.cwd, repo: pane.cwd, branch: "", baseCommit: "",
+      createdAt: Date.now(), startupTimeoutSeconds: 30, phase: "running", delivered: [], mode: "interactive",
+      name: `Request to ${pane.name ?? paneId}`, placement: "pane",
+      existing: { sessionID: pane.agent_session.value, messageID: this.messageID(), socket: process.env.HERDR_SOCKET_PATH, terminalID: pane.terminal_id },
+    };
+    await this.save(job);
+    this.jobs.set(jobId, job);
+    await lifecycle(jobId, "created");
+    this.watchJob(jobId);
+    return `Queued local request ${jobId} for ${paneId} (${pane.agent_session.value}). ` +
+      "The target must run the updated Envoy plugin. Delivery waits for idle; no terminal input was sent. " +
+      "Use list_sessions to inspect requestDelivered. The pane, conversation and checkout remain independently owned.";
   }
 
   async createJob(input: {
