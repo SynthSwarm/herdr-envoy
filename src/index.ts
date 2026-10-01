@@ -1,5 +1,6 @@
 // index.ts — single plugin, dual role (spec §12). Both coordinator and delegate
-// are opencode processes running this same code; JOBDIR_ENV decides the role.
+// are opencode processes running this same code; JOBDIR_ENV selects startup tools.
+// Request-aware tools also recover bound interactive peers after environment loss.
 import type { Plugin, Hooks } from "@opencode-ai/plugin";
 import { JOBDIR_ENV } from "./protocol.js";
 import { consume, completeTool, askTool, startHeartbeat, type DelegateState } from "./delegate.js";

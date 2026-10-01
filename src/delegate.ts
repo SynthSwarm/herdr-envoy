@@ -3,7 +3,7 @@
 // Bounded delegates publish result.json; interactive delegates hand back session control.
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { tool } from "@opencode-ai/plugin";
+import { tool, type PluginInput } from "@opencode-ai/plugin";
 import { lifecycle } from "./log.js";
 const z = tool.schema;
 import {
@@ -14,6 +14,7 @@ import {
   rand,
   withSessionLock,
   readJSON,
+  sessionRoot,
   type Block,
   type Consumed,
   type Handoff,
@@ -116,13 +117,58 @@ async function readInteractiveSession(state: DelegateState, sessionID?: string):
       session.generation < (state.interactiveGeneration ?? c.generation)) {
     throw new Error("peer-delegate: interactive session generation mismatch");
   }
-  if (!["active", "paused", "commit", "discard"].includes(session.status)) {
+  if (!["active", "paused", "completed", "commit", "discard"].includes(session.status)) {
     throw new Error("peer-delegate: invalid interactive session status");
   }
   if (session.sessionID !== undefined && session.sessionID !== sessionID) {
     throw new Error("peer-delegate: interactive session is bound to another sessionID");
   }
   return session;
+}
+
+// A restored OpenCode conversation need not retain its original launch environment.
+// Recover only an already-bound owned peer, never adopt a checkout by path alone.
+export async function recoverInteractivePeer($: PluginInput["$"], directory: string, sessionID: string, jobId?: string): Promise<DelegateState> {
+  if (!sessionID) throw new Error("Peer recovery requires ctx.sessionID");
+  const root = sessionRoot();
+  const ids = jobId ? [jobId] : await fs.readdir(root).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const current = await fs.realpath(directory);
+  const candidates: { dir: string; branch: string; session: InteractiveSession; standalone: boolean }[] = [];
+  for (const id of ids.filter((id) => /^[a-f0-9]{32}$/.test(id))) {
+    const dir = path.join(root, id);
+    const job = await readJSON<{ jobId: string; mode?: string; existing?: unknown; worktree: string; branch: string;
+      phase: string; placement?: string; workspace?: string; worktreeCreated?: boolean; resourceUncertain?: boolean }>(path.join(dir, FILES.coordinator)).catch(() => null);
+    if (!job || job.jobId !== id || job.mode !== "interactive" || job.existing !== undefined ||
+        typeof job.worktree !== "string" || typeof job.branch !== "string") continue;
+    if (await fs.realpath(job.worktree).catch(() => null) !== current) continue;
+    const session = await readJSON<InteractiveSession>(path.join(dir, FILES.session));
+    if (session.sessionID !== sessionID) continue;
+    const standalone = job.placement === "workspace";
+    if (job.phase !== "running" || !(standalone ? job.workspace : job.worktreeCreated) || job.resourceUncertain) {
+      throw new Error("Peer recovery refused: checkout ownership is not ready or cleanup has started");
+    }
+    candidates.push({ dir, branch: job.branch, session, standalone });
+  }
+  if (candidates.length !== 1) throw new Error(candidates.length > 1
+    ? "Ambiguous saved peer sessions. Specify the exact jobId; never guess."
+    : "No saved peer matches this conversation and checkout. Specify the jobId from a queued request, or ask the coordinator to resume the original peer conversation.");
+  const { dir, branch, session, standalone } = candidates[0];
+  // Do not consume an unbound handoff or write new authority while recovering.
+  const consumed = await readJSON<Consumed>(path.join(dir, FILES.consumed));
+  if (consumed.jobId !== path.basename(dir)) throw new Error("Peer recovery identity mismatch");
+  const state: DelegateState = { jobDir: dir, task: consumed.task ?? null, consumed };
+  await readInteractiveSession(state, sessionID);
+  if (!standalone) {
+    const actualBranch = (await $`git -C ${directory} branch --show-current`.text()).trim();
+    if (actualBranch !== branch) throw new Error("Peer recovery refused: checkout branch has changed");
+  }
+  // A fresh process adopts the saved generation. Subsequent calls retain this
+  // snapshot, so a coordinator resume still requires an explicit read_task.
+  state.interactiveGeneration = session.generation;
+  return state;
 }
 
 // The `read_task` tool exposed to the delegate agent. The coordinator launches
@@ -154,15 +200,20 @@ export function readTaskTool(state: DelegateState) {
           `## Task\n${task}\n\n` +
           `## Current control\nStatus: ${session.status}. Generation: ${session.generation}.\n` +
           (session.status === "active" ? `Work with the user on their instructions.\n` :
+            session.status === "completed" ? `This task is completed. Use a new request or \`open_session\` for further work.\n` :
             `Do not continue work until the coordinator resumes this session. ` +
             (session.status === "paused" ?
-              `An explicit user instruction to commit or discard may be handed back without resuming.\n` :
+              `An explicit user instruction to complete, commit or discard may be handed back without resuming.\n` :
               `Ask the coordinator to resolve the existing hand-back or use \`open_session\` for further work.\n`)) +
           `Call \`read_task\` again to reread current control, especially after a resume.\n\n` +
-          `## Hand-back\nDo not call \`complete\` or \`ask\`, or automatically report completion. ` +
-          `Ask the user directly when you need guidance. Call \`hand_back\` only after the user explicitly ` +
-          `instructs you to pause, commit, or discard. Quote that explicit instruction in userInstruction ` +
-          `and include a summary, checks and risks. Never invent or infer permission from task completion.\n` +
+          `## Hand-back\nDo not call \`complete\` or \`ask\`. Ask the user directly when you need guidance. ` +
+          `When the active task is finished and there is nothing to commit for this task, automatically call ` +
+          `\`hand_back\` with disposition="completed", the deliverable in summary, checks and risks. ` +
+          `Do not ask for confirmation or invent a userInstruction. Verify that no task changes need committing; ` +
+          `a clean checkout alone does not establish that the task is finished. Respect an explicit instruction to keep the session open. ` +
+          `If the user asks to hand back finished work with nothing to commit, use completed directly. ` +
+          `Call \`hand_back\` with pause, commit or discard only after the user explicitly instructs you to do so. ` +
+          `Quote that instruction in userInstruction. Paused work requires explicit user direction to complete.\n` +
           `Do not automatically commit or clean up. A commit or discard hand-back is a request to the ` +
           `coordinator, not permission to commit, delete the worktree, or close this session yourself.`;
       }
@@ -185,19 +236,23 @@ export function readTaskTool(state: DelegateState) {
 
 export function handBackTool(state: DelegateState) {
   const args = {
-    disposition: z.enum(["pause", "commit", "discard"]),
+    disposition: z.enum(["pause", "completed", "commit", "discard"]),
     summary: z.string().describe("Summarise the work and its current state."),
     checks: z.array(z.string()).default([]),
     risks: z.array(z.string()).default([]),
-    userInstruction: z.string().min(1).refine((value) => value.trim().length > 0)
-      .describe("Mandatory: quote the user's explicit instruction to pause, commit, or discard. Do not infer consent."),
+    userInstruction: z.string().min(1).refine((value) => value.trim().length > 0).optional()
+      .describe("For pause, commit, discard or completing paused work, quote the user's explicit instruction. Omit for automatic completed hand-back."),
   };
   return tool({
-    description: "Hand control back only when the user explicitly asks to pause, commit, or discard. " +
-      "Publishes the request without committing or cleaning up. Argument validation cannot verify natural-language consent.",
+    description: "Automatically hand back completed work with nothing to commit using disposition=completed. " +
+      "Pause, commit and discard require explicit user direction. Include the deliverable in summary. " +
+      "Publishes the report without committing or cleaning up. Argument validation cannot verify task completion or natural-language consent.",
     args,
     async execute(input, ctx) {
       const request = z.object(args).parse(input);
+      if (request.disposition !== "completed" && !request.userInstruction) {
+        throw new Error("userInstruction is required for pause, commit or discard");
+      }
       if (!state.consumed) throw new Error("peer-delegate: no interactive job auth");
       return withSessionLock(state.consumed.jobId, async () => {
       const session = await readInteractiveSession(state, ctx?.sessionID);
@@ -219,6 +274,9 @@ export function handBackTool(state: DelegateState) {
           throw new Error(`peer-delegate: interactive session is ${session.status} ` +
             `(generation ${session.generation}); cannot report ${request.disposition}. ` +
             `Ask the coordinator to resolve the existing hand-back, resume commit-ready work, or use open_session for a new task.`);
+        }
+        if (status === "completed" && !userInstruction) {
+          throw new Error("userInstruction is required to complete paused work");
         }
       }
       await atomicWriteJSON(path.join(state.jobDir, FILES.session), {

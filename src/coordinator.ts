@@ -351,7 +351,7 @@ export class Coordinator {
     const auth = await this.loadConsumed(job.jobId) ?? await readJSON<Handoff>(path.join(dir, FILES.handoff));
     if (session.protocolVersion !== PROTOCOL_VERSION || session.jobId !== job.jobId ||
         session.completionToken !== auth.completionToken || !Number.isSafeInteger(session.generation) ||
-        session.generation < auth.generation || !["active", "paused", "commit", "discard"].includes(session.status)) {
+        session.generation < auth.generation || !["active", "paused", "completed", "commit", "discard"].includes(session.status)) {
       throw new Error("Invalid interactive session identity or state");
     }
     return session;
@@ -644,8 +644,10 @@ export class Coordinator {
             ? "PAUSED. Preserve the conversation, checkout and branch. Do not commit, merge or reap. Use resume_session to continue."
             : session.status === "commit"
               ? "READY FOR COMMIT. Review the diff and run checks, then commit in the worktree BEFORE reap_delegate. No merge or push is authorised."
-              : `DISCARD REQUESTED. Ask the user to confirm deletion of this checkout and any unwanted commits. Only then reap_delegate with discard=true, confirmation=${jobId}, and deleteBranch if approved.`;
-          await this.promptSelf(jobId, key, `[peer-session] ${job.name} (${jobId}): ${instruction}\nSummary: ${session.summary}\nChecks: ${(session.checks ?? []).join("; ")}\nRisks: ${(session.risks ?? []).join("; ")}\nWorktree: ${job.worktree}\nBranch: ${job.branch}\nUser instruction: ${session.userInstruction}`);
+              : session.status === "completed"
+                ? "COMPLETED. Review the deliverable and report the outcome. Nothing needs committing for this task. No automatic cleanup is requested. Use a new job for follow-up work."
+                : `DISCARD REQUESTED. Ask the user to confirm deletion of this checkout and any unwanted commits. Only then reap_delegate with discard=true, confirmation=${jobId}, and deleteBranch if approved.`;
+          await this.promptSelf(jobId, key, `[peer-session] ${job.name} (${jobId}): ${instruction}\nSummary: ${session.summary}\nChecks: ${(session.checks ?? []).join("; ")}\nRisks: ${(session.risks ?? []).join("; ")}\nWorktree: ${job.worktree}\nBranch: ${job.branch}` + (session.userInstruction ? `\nUser instruction: ${session.userInstruction}` : ""));
         } else if (!session.sessionID && Date.now() - job.createdAt > job.startupTimeoutSeconds * 1000 && !job.delivered.includes("startup-timeout")) {
           await this.notifyStartupTimeout(jobId);
         }
@@ -869,7 +871,7 @@ export class Coordinator {
       await this.place(job, false);
       const bootPrompt =
         `Call the \`read_task\` tool now to get your task, then carry it out in this worktree. ` +
-        (job.mode === "interactive" ? `Work interactively with the user. Do not finish automatically; hand_back only on explicit user instruction.` :
+        (job.mode === "interactive" ? `Work interactively with the user. Automatically hand_back with disposition=completed when the task is finished and has nothing to commit. Pause, commit and discard require explicit user instruction.` :
           `Call \`complete\` when done; call \`ask\` if you need a decision from the coordinator.`);
       await this.launch(job, bootPrompt);
       job.phase = "running";
@@ -1144,7 +1146,7 @@ export function replyTool(coord: Coordinator) {
 
 export function openSessionTool(coord: Coordinator) {
   return tool({
-    description: "Open a named interactive peer. pane/subworkspace create isolated Git worktrees; workspace opens an existing working folder directly in an independent workspace. Ask for the folder if missing. No automatic completion.",
+    description: "Open a named interactive peer. pane/subworkspace create isolated Git worktrees; workspace opens an existing working folder directly in an independent workspace. Ask for the folder if missing. Finished work with nothing to commit is handed back as completed automatically.",
     args: {
       agent: z.string(), name: z.string().min(1), task: z.string().min(1), repo: z.string().describe("Absolute repository or existing working folder for workspace placement."), branch: z.string().optional(),
       baseCommit: z.string().optional(), targetBranch: z.string().optional(),
@@ -1153,7 +1155,7 @@ export function openSessionTool(coord: Coordinator) {
     async execute(args, context) {
       const { jobId } = await coord.createJob({ ...args, mode: "interactive", sessionID: context.sessionID, outputContract: "code-change" });
       const { pane, worktree } = await coord.spawnDelegate(jobId, { ...args, outputContract: "code-change" });
-      return `Opened interactive session ${args.name} (${jobId}) in ${args.placement ?? "pane"}, pane ${pane}.\nAgent identity: ${coord.agentIdentity(jobId)}\nWorktree: ${worktree}\nThe user steers this session and explicitly pauses, hands back for commit, or requests discard.`;
+      return `Opened interactive session ${args.name} (${jobId}) in ${args.placement ?? "pane"}, pane ${pane}.\nAgent identity: ${coord.agentIdentity(jobId)}\nWorktree: ${worktree}\nThe user steers this session. Finished work with nothing to commit is handed back as completed automatically; pause, commit and discard require explicit user direction.`;
     },
   });
 }

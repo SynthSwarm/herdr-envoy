@@ -60,11 +60,17 @@ reap/reply/resume, subject to existing ownership checks. Never guess ambiguous o
 For an existing LOCAL OpenCode agent, use \`request_agent({paneId, sessionId, task})\` from the Local
 discovery inventory. Both sessions need the updated plugin. Requests wait for idle and earlier
 requests' handback; no terminal input, new checkout or ownership takeover. The recipient uses
-\`read_task({jobId})\` and \`hand_back({jobId, ...})\` with explicit user direction. Without jobId,
+\`read_task({jobId})\` and automatically calls \`hand_back({jobId, disposition: "completed", summary, checks, risks})\`
+when the request is finished with nothing to commit. Pause, commit and discard require explicit user direction. Without jobId,
 those tools still refer to its original delegation. \`list_sessions\` exposes requestDelivered,
 requestAttemptedAt and requestCancelled. An attempted but unconfirmed delivery is not replayed.
 \`cancel_request\` retires the queued request, never interrupts already-submitted work. Existing
 agents cannot be reaped or resumed as owned sessions. Do not pass a remote pane ID.
+
+After an outage, the same peer conversation in its original worktree can use \`read_task\` or
+\`hand_back\` without the original launch environment. Omit jobId for one matching owned peer or
+pass its exact saved job ID. Do not use \`list_sessions\` to discover a peer's own identity or
+manually edit saved authentication. Recovery refuses replacement conversations and changed branches.
 
 Use \`delegate\` for bounded work with a terminal completion report. Use \`open_session\` for
 durable interactive work. Both tools support \`pane\` and \`subworkspace\`, defaulting to
@@ -151,11 +157,17 @@ merging. Never automatically merge or push. Advisory content is trusted, not ind
 verified. Bounded completion is terminal with no reopen operation; use a new job for follow-up.
 
 ## Interactive handback and resume
-An interactive peer must call \`hand_back\` ONLY on explicit user instruction. Finishing the
-initial task, going idle or deciding the work looks ready is not a handback instruction.
+When an active task is finished with nothing to commit, the peer automatically calls \`hand_back\`
+with disposition \`completed\` and the deliverable in summary. Do not ask for confirmation or invent
+a userInstruction. Verify task completion and that no task changes need committing. A clean checkout
+or idle agent alone is not completion. Respect an explicit instruction to keep the session open.
+Pause, commit and discard require explicit user direction.
+- "hand this back" with finished work and nothing to commit: use \`completed\` directly.
+- \`completed\` is terminal. Review and report the deliverable. It does not automatically commit or
+  clean up. Follow-up work needs a new job. A completed owned checkout is eligible for ordinary cleanup.
 - "done for now": \`pause\` preserves the conversation, pane/workspace, checkout, branch and
   metadata. Do not commit or reap.
-- "hand this back": \`commit\` returns control to the orchestrator, who reviews the diff, runs
+- "hand this back" with changes to commit: \`commit\` returns control to the orchestrator, who reviews the diff, runs
   required checks and commits in the session checkout BEFORE reaping. A failed review, check or
   commit preserves the session. The peer does not commit or clean up merely because it hands back.
 - "discard this": \`discard\` records a discard request. Obtain separate explicit destructive
@@ -166,8 +178,8 @@ sessions for the current project owned by the calling orchestrator \`sessionID\`
 generation, summary, checks, risks, \`notificationPending\` and \`notificationAttemptedAt\`
 (the pending note's \`attemptedAt\`) but no tokens. Recovery does not broaden listing scope.
 
-Explicit \`hand_back\` may move paused work to commit/discard without resuming. Same-disposition
-retries preserve the original report even with a different summary. Commit/discard cannot
+Explicit \`hand_back\` may move paused work to completed/commit/discard without resuming. Same-disposition
+retries preserve the original report even with a different summary. Completed/commit/discard cannot
 transition through \`hand_back\`; only explicit orchestrator resume can reopen commit-ready work.
 Coordinator operations and \`hand_back\` share per-session locks.
 

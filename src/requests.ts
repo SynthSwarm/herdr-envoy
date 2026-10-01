@@ -2,8 +2,9 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tool, type PluginInput } from "@opencode-ai/plugin";
-import { consume, handBackTool, readTaskTool, type DelegateState } from "./delegate.js";
+import { consume, handBackTool, readTaskTool, recoverInteractivePeer, type DelegateState } from "./delegate.js";
 import { atomicWriteJSON, FILES, readJSON, sessionRoot, withSessionLock, type InteractiveSession } from "./protocol.js";
+import { lifecycle } from "./log.js";
 
 const z = tool.schema;
 // Current session settings are returned at runtime but absent from the older SDK's Session type.
@@ -19,6 +20,7 @@ const metadata = z.object({
 export function existingRequests($: PluginInput["$"], client: PluginInput["client"], directory: string, delegate?: DelegateState) {
   let stopped = false;
   let scan: Promise<void> | undefined;
+  const recovered = new Map<string, DelegateState>();
   const load = async (jobId: string, sessionID: string) => {
     if (!/^[a-f0-9]{32}$/.test(jobId)) throw new Error("Invalid request ID");
     const dir = path.join(sessionRoot(), jobId);
@@ -38,14 +40,30 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
     }
     return consume(dir);
   };
+  const resolve = async (jobId: string | undefined, sessionID: string) => {
+    if (jobId && !/^[a-f0-9]{32}$/.test(jobId)) throw new Error("Invalid request ID");
+    if (delegate && (!jobId || jobId === delegate.consumed?.jobId)) return { state: delegate, existing: false };
+    if (jobId) {
+      const job = await readJSON<{ existing?: unknown }>(path.join(sessionRoot(), jobId, FILES.coordinator));
+      if (job.existing !== undefined) return { state: await load(jobId, sessionID), existing: true };
+    }
+    const peer = await recoverInteractivePeer($, directory, sessionID, jobId);
+    const key = `${sessionID}:${peer.consumed!.jobId}`;
+    let state = recovered.get(key);
+    if (!state) {
+      state = peer;
+      recovered.set(key, state);
+      await lifecycle(peer.consumed!.jobId, "peer_recovered", { generation: peer.interactiveGeneration });
+    }
+    return { state, existing: false };
+  };
   const read = tool({
-    description: "Read a delivered local request without replacing your existing task or conversation. Use the exact jobId from its notification.",
-    args: { jobId: z.string().optional().describe("Exact existing-agent request ID. Omit only for your original Envoy delegation.") },
+    description: "Read your original delegated task, recovering its saved conversation and checkout after restart, or a delivered local request by exact jobId. Does not replace your conversation.",
+    args: { jobId: z.string().optional().describe("Exact request or saved peer job ID. Omit for your original Envoy delegation, including after restart.") },
     async execute({ jobId }, ctx) {
-      if (!jobId && !delegate) throw new Error("Specify the jobId from the queued request");
-      const state = jobId ? await load(jobId, ctx.sessionID) : delegate!;
+      const { state, existing } = await resolve(jobId, ctx?.sessionID);
       const text = await readTaskTool(state).execute({}, ctx);
-      if (!jobId && state.consumed && ctx?.sessionID) {
+      if (!existing && state.consumed && ctx?.sessionID) {
         await withSessionLock(state.consumed.jobId, async () => {
           const file = path.join(state.jobDir, "agent-session.json");
           const saved = await readJSON<{ sessionID: string }>(file).catch((error) => {
@@ -56,16 +74,16 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
           if (!saved) await atomicWriteJSON(file, { sessionID: ctx.sessionID });
         }, 100);
       }
-      return jobId ? `This is a request alongside your existing work, not a transfer of your conversation or checkout. Keep the request scoped to its brief. Use jobId=${jobId} for its hand_back.\n\n${text}` : text;
+      return existing ? `This is a request alongside your existing work, not a transfer of your conversation or checkout. Keep the request scoped to its brief. Use jobId=${jobId} for its hand_back.\n\n${text}` : text;
     },
   });
   const handback = handBackTool({ jobDir: "", task: null, consumed: null });
   const handBack = tool({
-    description: "Hand back a delivered local request only on explicit user direction. This never transfers ownership of your existing conversation or checkout.",
-    args: { ...handback.args, jobId: z.string().optional().describe("Exact existing-agent request ID. Omit only for your original Envoy delegation.") },
+    description: "Hand back your original peer task (also after restart) or a delivered request by exact jobId. Automatically use completed for finished work with nothing to commit. Pause, commit and discard require explicit user direction. Existing requests never transfer resource ownership.",
+    args: { ...handback.args, jobId: read.args.jobId },
     async execute({ jobId, ...input }, ctx) {
-      if (!jobId && !delegate) throw new Error("Specify the jobId from the queued request");
-      return handBackTool(jobId ? await load(jobId, ctx.sessionID) : delegate!).execute(input, ctx);
+      const { state } = await resolve(jobId, ctx?.sessionID);
+      return handBackTool(state).execute(input, ctx);
     },
   });
   const tick = () => {
@@ -107,8 +125,8 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
           if (conversation.data?.id !== id || conversation.data.directory !== directory) return;
           const text = `[envoy request ${current.jobId}] A coordinator queued a request for this existing conversation. ` +
             `Call read_task with jobId="${current.jobId}". Preserve your existing work and instructions. ` +
-            `For this request use hand_back with the same jobId only when the user explicitly asks to pause, commit or discard. ` +
-            "Do not infer handback permission from finishing the request. No automatic commit, cleanup or conversation takeover is authorised.";
+            `When this request is finished and has nothing to commit, automatically use hand_back with the same jobId and disposition=completed, including the deliverable in summary. ` +
+            "Do not ask for confirmation or invent a userInstruction. Pause, commit and discard still require explicit user direction. No automatic commit, cleanup or conversation takeover is authorised.";
           const receipt = await client.session.message({ ...options, path: { id, messageID: current.existing.messageID } });
           if (receipt.error && receipt.response.status !== 404) return;
           if (receipt.data?.parts.some((p) => p.type === "text" && p.text === text)) {

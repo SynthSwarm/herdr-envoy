@@ -29,9 +29,14 @@ Discovery does not claim agents or authorise sending requests. Creation/resume t
 
 Use \`request_agent({paneId, sessionId, task})\` for an existing LOCAL OpenCode agent, using the Local
 inventory from \`list_machines\`. Both processes need the updated plugin. Requests wait for idle
-and earlier requests' explicit handback. No terminal input, new checkout or ownership takeover.
+and earlier requests' handback. No terminal input, new checkout or ownership takeover.
 The target uses \`read_task({jobId})\` and \`hand_back({jobId, ...})\`; omit jobId only for its
-original delegation. Handback still requires explicit user direction, never inferred completion.
+original delegation. Automatically hand back finished work with nothing to commit as \`completed\`.
+Pause, commit and discard require explicit user direction.
+After an outage, the same peer conversation in its original worktree can use \`read_task\` or
+\`hand_back\` without the original launch environment. Omit jobId for one matching owned peer or
+pass its exact saved job ID. Do not use \`list_sessions\` to discover a peer's own identity or
+manually edit saved authentication. Recovery refuses replacement conversations and changed branches.
 Inspect \`list_sessions\` for requestDelivered/requestAttemptedAt/requestCancelled. An attempted
 but unconfirmed delivery is not automatically replayed. \`cancel_request\` retires a request
 without interrupting already-submitted work. Never reap/resume an existing-agent request.
@@ -126,15 +131,22 @@ and report the outcome. Handling the follow-up depends on the note:
   checks and user approval for merge. Completion is terminal; follow-up work needs a new job.
 
 Interactive peers expose \`read_task\` and \`hand_back\`, never \`complete\` or \`ask\`.
-They may hand back ONLY on explicit user instruction, not when the initial task finishes:
+When the active task is finished with nothing to commit, automatically call \`hand_back\` with
+disposition \`completed\`, including the deliverable in summary, checks and risks. Do not ask for
+confirmation or invent a userInstruction. Verify no task changes need committing. A clean checkout
+or idle agent alone is not completion. Respect an explicit instruction to keep the session open.
+Pause, commit and discard require explicit user direction:
+- "hand this back" with finished work and nothing to commit means \`completed\` directly.
+- \`completed\` is terminal. Review and report the deliverable. No automatic commit or cleanup.
+  Follow-up work needs a new job. A completed owned checkout is eligible for ordinary cleanup.
 - "done for now" means \`pause\`: preserve conversation, pane/workspace, worktree, branch and metadata.
-- "hand this back" means \`commit\`: the ORCHESTRATOR reviews changes, runs checks and commits in
+- "hand this back" with changes to commit means \`commit\`: the ORCHESTRATOR reviews changes, runs checks and commits in
   that checkout BEFORE reaping. The peer does not commit merely because it hands back.
 - "discard this" means \`discard\`: record a request, then obtain explicit destructive user
   confirmation in the orchestrator. The request alone does not authorise removal.
 
-Explicit \`hand_back\` may move paused work to commit/discard without resuming. Same-disposition
-retries preserve the original report even with a different summary. Commit/discard cannot
+Explicit \`hand_back\` may move paused work to completed/commit/discard without resuming. Same-disposition
+retries preserve the original report even with a different summary. Completed/commit/discard cannot
 transition through \`hand_back\`; only explicit orchestrator resume can reopen commit-ready work.
 Coordinator operations and \`hand_back\` share per-session locks.
 
