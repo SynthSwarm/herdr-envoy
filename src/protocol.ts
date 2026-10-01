@@ -14,7 +14,7 @@ export const JOBDIR_ENV = "PEER_DELEGATE_JOBDIR";
 export type OutputContract = "advisory" | "code-change";
 export type MergePolicy = "manual" | "auto-after-checks";
 export type Placement = "pane" | "subworkspace";
-export type SessionDisposition = "active" | "paused" | "commit" | "discard";
+export type SessionDisposition = "active" | "paused" | "completed" | "commit" | "discard";
 
 export interface InteractiveSession {
   protocolVersion: number;

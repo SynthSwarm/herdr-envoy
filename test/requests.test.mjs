@@ -91,7 +91,7 @@ test("existing local requests wait while busy, preserve persona and hand back wi
   assert.equal(listing[0].requestDelivered, true);
 });
 
-test("one outstanding request gates later requests until handback", async (t) => {
+test("automatic completion returns the deliverable and releases the next queued request", async (t) => {
   const f = await fixture(t);
   const first = await f.enqueue();
   const second = await f.enqueue();
@@ -103,9 +103,20 @@ test("one outstanding request gates later requests until handback", async (t) =>
   await Promise.all([f.receiver.tick(), f.receiver.tick()]);
   await f.receiver.tick();
   assert.equal(f.posts.length, 1);
-  await f.receiver.hand_back.execute({ jobId: first, disposition: "pause", summary: "Paused", userInstruction: "Pause" }, { sessionID: "target-session" });
+  assert.match(f.posts[0].body.parts[0].text, /automatically use hand_back.*disposition=completed/);
+  const ctx = { sessionID: "target-session" };
+  assert.match(await f.receiver.read_task.execute({ jobId: first }, ctx), /automatically call `hand_back` with disposition="completed"/);
+  await f.receiver.hand_back.execute({ jobId: first, disposition: "completed", summary: "Review complete. Use the image model for character variants." }, ctx);
+  assert.equal((await readJSON(f.file(first, "session"))).status, "completed");
   await f.receiver.tick();
   assert.equal(f.posts.length, 2);
+  await f.coordinator.reconcile(first);
+  await f.coordinator.reconcile(first);
+  const note = f.posts.find((p) => p.path.id === "owner-session").body.parts[0].text;
+  assert.match(note, /EXISTING-AGENT HAND-BACK \(completed\)/);
+  assert.match(note, /Use the image model for character variants/);
+  assert.doesNotMatch(note, /User instruction:|undefined/);
+  await assert.rejects(f.coordinator.reap(first), /not owned/);
 });
 
 test("lost submission response recovers from receipt without duplicate input", async (t) => {
@@ -199,8 +210,9 @@ test("rejects invalid targets and request tool IDs without side effects", async 
   await assert.rejects(f.coordinator.requestAgent("target-pane", "task", "owner", "stale-session"), /live local/);
   f.pane.agent = "claude";
   await assert.rejects(f.coordinator.requestAgent("target-pane", "task", "owner"), /live local/);
-  await assert.rejects(f.receiver.read_task.execute({}, {}), /Specify/);
-  await assert.rejects(f.receiver.hand_back.execute({}, {}), /Specify/);
+  await assert.rejects(f.receiver.read_task.execute({}, {}), /ctx.sessionID/);
+  await assert.rejects(f.receiver.hand_back.execute({}, {}), /ctx.sessionID/);
+  await assert.rejects(f.receiver.read_task.execute({}, { sessionID: "unrelated" }), /No saved peer/);
   await assert.rejects(f.receiver.read_task.execute({ jobId: "../outside" }, {}), /Invalid request/);
   assert.equal(f.posts.length, 0);
 });

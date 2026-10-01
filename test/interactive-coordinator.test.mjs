@@ -11,6 +11,7 @@ import {
   Coordinator, delegateTool, openSessionTool, listSessionsTool, resumeSessionTool, reapTool,
 } from "../dist/coordinator.js";
 import { consume, readTaskTool, handBackTool } from "../dist/delegate.js";
+import { existingRequests } from "../dist/requests.js";
 import { atomicWriteJSON, readJSON, FILES, JOBDIR_ENV, root, sessionRoot, withSessionLock } from "../dist/protocol.js";
 
 const exec = promisify(execFile);
@@ -250,7 +251,7 @@ async function fixture(t) {
     await settle(job);
     return state(job);
   };
-  return { dir, repo, base, git, c, coordinator, calls, panes, workspaces, sources, closeWorkspace, options,
+  return { dir, repo, base, git, shell, c, coordinator, calls, panes, workspaces, sources, closeWorkspace, options,
     conversations, messages, posts, gets, metadata, state, logs, settle, open, bind, handBack };
 }
 
@@ -279,7 +280,7 @@ test("open_session defaults to pane placement and persists an interactive handof
   assert.deepEqual(split, ["herdr", "pane", "split", "coordinator-pane", "--direction", "right", "--ratio", "0.5", "--cwd", job.worktree, "--no-focus", "--env", `${JOBDIR_ENV}=${job.jobDir}`]);
   const launch = f.calls.find((args) => args[2] === "run");
   assert.ok(launch[4].startsWith(`env ${JOBDIR_ENV}='${job.jobDir}' opencode --agent 'worker' --auto`));
-  assert.match(launch[4], /read_task.*Work interactively.*hand_back only on explicit user instruction/);
+  assert.match(launch[4], /read_task.*Work interactively.*Automatically hand_back with disposition=completed/);
   assert.doesNotMatch(launch[4], /--session|Keep this task|Call `complete`/);
   assert.deepEqual(f.calls.find((args) => args[2] === "rename"), ["herdr", "pane", "rename", job.pane, job.name]);
   const schema = tool.schema.object(openSessionTool(f.c).args);
@@ -336,6 +337,121 @@ test("pause delivers once with no commit, merge or cleanup and refuses even expl
   assert.equal(f.panes.has(job.pane), true);
   assert.equal((await f.metadata(job)).phase, "running");
   assert.equal(await fs.readFile(path.join(job.worktree, "tracked.txt"), "utf8"), "changed\n");
+});
+
+for (const explicit of [false, true]) {
+  test(`restored peer ${explicit ? "by exact job ID" : "without launch environment"} hands back dirty work to its original coordinator`, async (t) => {
+    const f = await fixture(t);
+    const job = await f.open({ placement: "subworkspace" });
+    const { context } = await f.bind(job);
+    await fs.writeFile(path.join(job.worktree, "draft.txt"), "survived the outage\n");
+    await fs.rm(root(), { recursive: true, force: true });
+    process.env.HERDR_PANE_ID = "restored-pane";
+    const tools = existingRequests(f.shell, {}, job.worktree);
+    t.after(() => tools.dispose());
+    const args = explicit ? { jobId: job.jobId } : {};
+    const before = await f.state(job);
+    // Reproduce hand_back as the very first tool after restart.
+    await tools.hand_back.execute({ ...args, disposition: "commit", summary: "Recovered presentation work", userInstruction: "Hand back as commit" }, context);
+    const after = await f.state(job);
+    assert.equal(after.status, "commit");
+    assert.equal(after.sessionID, before.sessionID);
+    assert.equal(after.generation, before.generation);
+    assert.equal(after.completionToken, before.completionToken);
+    const text = await tools.read_task.execute(args, context);
+    assert.match(text, /interactive delegated peer/);
+    assert.doesNotMatch(text, /request alongside/);
+    await f.settle(job);
+    assert.equal(f.posts.length, 1);
+    assert.match(f.posts[0].parts[0].text, /READY FOR COMMIT/);
+    assert.equal(f.posts[0].path, `/session/${owner.sessionID}/prompt_async`);
+    assert.equal((await f.logs()).filter((row) => row.event === "peer_recovered" && row.jobId === job.jobId).length, 1);
+    assert.equal(await fs.readFile(path.join(job.worktree, "draft.txt"), "utf8"), "survived the outage\n");
+    assert.equal((await f.git("-C", job.worktree, "rev-parse", "HEAD")).stdout.trim(), f.base);
+    assert.match(await tools.hand_back.execute({ ...args, disposition: "commit", summary: "Retry", userInstruction: "Hand back as commit" }, context), /already reported/);
+  });
+}
+
+test("restored peer keeps generation checks and read_task adopts a resumed generation", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  const { context } = await f.bind(job);
+  const tools = existingRequests(f.shell, {}, job.worktree);
+  t.after(() => tools.dispose());
+  await tools.read_task.execute({}, context);
+  const file = path.join(job.jobDir, FILES.session);
+  await atomicWriteJSON(file, { ...await f.state(job), generation: 2 });
+  const args = { disposition: "completed", summary: "Done" };
+  await assert.rejects(tools.hand_back.execute(args, context), /generation changed/);
+  await tools.read_task.execute({ jobId: job.jobId }, context);
+  await tools.hand_back.execute(args, context);
+  assert.equal((await f.state(job)).generation, 2);
+});
+
+for (const mismatch of ["conversation", "unbound", "directory", "branch", "token", "cleanup", "uncertain", "missing auth"]) {
+  test(`peer recovery refuses ${mismatch} without rewriting saved authority`, async (t) => {
+    const f = await fixture(t);
+    const job = await f.open();
+    const { context } = await f.bind(job);
+    const sessionFile = path.join(job.jobDir, FILES.session);
+    await f.c.dispose();
+    const metadataFile = path.join(job.jobDir, FILES.coordinator);
+    if (mismatch === "unbound") await atomicWriteJSON(sessionFile, { ...await f.state(job), sessionID: undefined });
+    if (mismatch === "token") await atomicWriteJSON(sessionFile, { ...await f.state(job), completionToken: "other" });
+    if (mismatch === "cleanup") await atomicWriteJSON(metadataFile, { ...await f.metadata(job), phase: "cleanup" });
+    if (mismatch === "uncertain") await atomicWriteJSON(metadataFile, { ...await f.metadata(job), resourceUncertain: true });
+    if (mismatch === "missing auth") await fs.unlink(path.join(job.jobDir, FILES.consumed));
+    if (mismatch === "branch") await f.git("-C", job.worktree, "checkout", "--detach");
+    const before = await f.state(job);
+    const tools = existingRequests(f.shell, {}, mismatch === "directory" ? f.repo : job.worktree);
+    t.after(() => tools.dispose());
+    const ctx = mismatch === "conversation" ? { sessionID: "replacement" } : context;
+    for (const args of [{}, { jobId: job.jobId }]) {
+      await assert.rejects(tools.read_task.execute(args, ctx));
+      await assert.rejects(tools.hand_back.execute({ ...args, disposition: "commit", summary: "Ready", userInstruction: "Commit" }, ctx));
+    }
+    assert.deepEqual(await f.state(job), before);
+  });
+}
+
+test("peer recovery refuses ambiguous matches and exact IDs disambiguate", async (t) => {
+  const f = await fixture(t);
+  const first = await f.open();
+  const second = await f.open();
+  const { context } = await f.bind(first);
+  await f.bind(second);
+  await atomicWriteJSON(path.join(second.jobDir, FILES.coordinator), { ...await f.metadata(second), worktree: first.worktree, branch: first.branch });
+  await atomicWriteJSON(path.join(second.jobDir, FILES.session), { ...await f.state(second), sessionID: context.sessionID });
+  const tools = existingRequests(f.shell, {}, first.worktree);
+  t.after(() => tools.dispose());
+  await assert.rejects(tools.read_task.execute({}, context), /Ambiguous/);
+  assert.match(await tools.read_task.execute({ jobId: first.jobId }, context), /interactive delegated peer/);
+});
+
+test("completed work notifies once, survives recovery, refuses resume and permits ordinary cleanup", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open();
+  const { delegate, context } = await f.bind(job);
+  const start = f.calls.length;
+  await handBackTool(delegate).execute({ disposition: "completed", summary: "Research deliverable", checks: ["Sources reviewed"] }, context);
+  await f.settle(job);
+  await f.settle(job);
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].parts[0].text, /COMPLETED.*Review the deliverable/);
+  assert.doesNotMatch(f.posts[0].parts[0].text, /DISCARD REQUESTED|READY FOR COMMIT|User instruction:|undefined/);
+  assert.deepEqual(f.calls.slice(start), [], "completion issues no commit or cleanup commands");
+  assert.ok((await f.logs()).some((row) => row.event === "handback" && row.disposition === "completed"));
+  await f.c.dispose();
+  const recovered = f.coordinator();
+  await recovered.recover();
+  await f.settle(job, recovered);
+  assert.equal(JSON.parse(await recovered.listSessions(owner.sessionID))[0].status, "completed");
+  assert.equal(f.posts.length, 1);
+  await assert.rejects(recovered.resumeSession(job.jobId), /Only paused or commit-ready/);
+  await assert.rejects(recovered.reap(job.jobId, { discard: true, confirmation: job.jobId }), /not requested discard/);
+  await recovered.reap(job.jobId);
+  assert.equal(f.panes.has(job.pane), false);
+  await assert.rejects(fs.access(job.worktree), { code: "ENOENT" });
 });
 
 test("commit hand-back does not commit automatically and reap preserves dirty work until the user commits", async (t) => {

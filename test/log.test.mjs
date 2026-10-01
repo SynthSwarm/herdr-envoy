@@ -87,14 +87,14 @@ test("only enum values and safe integer numbers survive runtime detail validatio
   for (const row of await records(directory)) {
     assert.deepEqual(Object.keys(row).sort(), ["event", "jobId", "time"]);
   }
-  for (const disposition of ["active", "paused", "commit", "discard"]) {
+  for (const disposition of ["active", "paused", "completed", "commit", "discard"]) {
     await lifecycle(jobId, "handback", { disposition });
   }
   for (const reason of ["busy", "retry_delay", "readback", "transport", "state", "resume", "new_handback"]) {
     await lifecycle(jobId, "notification_deferred", { reason });
   }
   const rows = await records(directory);
-  assert.deepEqual(rows.filter(row => row.disposition).map(row => row.disposition), ["active", "paused", "commit", "discard"]);
+  assert.deepEqual(rows.filter(row => row.disposition).map(row => row.disposition), ["active", "paused", "completed", "commit", "discard"]);
   assert.deepEqual(rows.filter(row => row.reason).map(row => row.reason), ["busy", "retry_delay", "readback", "transport", "state", "resume", "new_handback"]);
 });
 

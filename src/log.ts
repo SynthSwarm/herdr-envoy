@@ -2,7 +2,7 @@ import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 import { sessionRoot } from "./protocol.js";
 
-const events = ["created", "recovered", "launch_started", "launch_failed",
+const events = ["created", "recovered", "peer_recovered", "launch_started", "launch_failed",
   "notification_queued", "notification_deferred", "notification_attempted",
   "notification_delivered", "notification_superseded", "reconciliation_failed",
   "resume_started", "resume_completed", "resume_failed", "handback", "handback_duplicate",
@@ -12,7 +12,7 @@ export type LifecycleEvent = typeof events[number];
 
 interface Details {
   generation?: number;
-  disposition?: "active" | "paused" | "commit" | "discard";
+  disposition?: "active" | "paused" | "completed" | "commit" | "discard";
   reason?: "busy" | "retry_delay" | "readback" | "transport" | "state" | "resume" | "new_handback";
   httpStatus?: number;
 }
@@ -36,7 +36,7 @@ export async function lifecycle(jobId: string, event: LifecycleEvent, details: D
     const record = {
       time, jobId, event,
       generation: Number.isSafeInteger(generation) ? generation : undefined,
-      disposition: ["active", "paused", "commit", "discard"].includes(disposition ?? "") ? disposition : undefined,
+      disposition: ["active", "paused", "completed", "commit", "discard"].includes(disposition ?? "") ? disposition : undefined,
       reason: ["busy", "retry_delay", "readback", "transport", "state", "resume", "new_handback"].includes(reason ?? "") ? reason : undefined,
       httpStatus: Number.isSafeInteger(httpStatus) ? httpStatus : undefined,
     };

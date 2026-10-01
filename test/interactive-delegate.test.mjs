@@ -50,6 +50,8 @@ test("interactive consume preserves mode and read_task durably binds the caller"
   assert.match(text, /only after the user explicitly/);
   assert.match(text, /Do not call `complete` or `ask`/);
   assert.match(text, /Do not automatically commit or clean up/);
+  assert.match(text, /automatically call `hand_back` with disposition="completed"/);
+  assert.match(text, /Do not ask for confirmation or invent a userInstruction/);
   assert.match(text, /reread current control/);
   assert.ok(text.includes(f.handoff.task));
   assert.ok(!text.includes(f.session.completionToken));
@@ -87,7 +89,7 @@ test("pause and coordinator resume use fresh control and a new generation", asyn
   assert.equal(restarted.interactiveGeneration, 2);
 });
 
-for (const disposition of ["pause", "commit", "discard"]) {
+for (const disposition of ["pause", "completed", "commit", "discard"]) {
   test(`${disposition} publishes atomically and same-disposition retries preserve the original report`, async (t) => {
     const f = await fixture(t);
     await readTaskTool(f.state).execute({}, ctx);
@@ -126,7 +128,7 @@ for (const disposition of ["pause", "commit", "discard"]) {
   });
 }
 
-for (const disposition of ["commit", "discard"]) {
+for (const disposition of ["completed", "commit", "discard"]) {
   test(`paused sessions can explicitly request ${disposition} without resuming`, async (t) => {
     const f = await fixture(t);
     const readTask = readTaskTool(f.state);
@@ -136,7 +138,7 @@ for (const disposition of ["commit", "discard"]) {
     const paused = await f.read();
     const guidance = await readTask.execute({}, ctx);
     assert.match(guidance, /Do not continue work until the coordinator resumes/);
-    assert.match(guidance, /commit or discard may be handed back without resuming/);
+    assert.match(guidance, /complete, commit or discard may be handed back without resuming/);
     const rename = fs.rename;
     const publish = t.mock.method(fs, "rename", async (source, dest) => {
       assert.equal(dest, f.file("session"));
@@ -153,7 +155,9 @@ for (const disposition of ["commit", "discard"]) {
     assert.notEqual(published.handbackID, paused.handbackID);
     assert.equal(publish.mock.callCount(), 1);
     assert.equal(f.state.interactiveGeneration, paused.generation);
-    assert.match(await readTask.execute({}, ctx), /resolve the existing hand-back.*open_session/);
+    assert.match(await readTask.execute({}, ctx), disposition === "completed"
+      ? /task is completed.*open_session/
+      : /resolve the existing hand-back.*open_session/);
   });
 
   test(`${disposition} rejects other dispositions with current state and recovery instructions`, async (t) => {
@@ -163,7 +167,7 @@ for (const disposition of ["commit", "discard"]) {
     await handBack.execute({ ...request, disposition }, ctx);
     const published = await f.read();
     const publish = t.mock.method(fs, "rename");
-    for (const next of ["pause", disposition === "commit" ? "discard" : "commit"]) {
+    for (const next of ["pause", "completed", "commit", "discard"].filter((next) => next !== disposition)) {
       await assert.rejects(handBack.execute({ ...request, disposition: next }, ctx),
         new RegExp(`session is ${disposition} \\(generation 1\\); cannot report ${next}.*resolve the existing hand-back.*open_session`));
     }
@@ -177,7 +181,7 @@ for (const disposition of ["pause", "commit", "discard"]) {
     const f = await fixture(t);
     await readTaskTool(f.state).execute({}, ctx);
     const handBack = handBackTool(f.state);
-    for (const prior of ["pause", "commit", "discard"]) {
+    for (const prior of ["pause", "completed", "commit", "discard"]) {
       await f.write({ ...f.session, sessionID: ctx.sessionID });
       await handBack.execute({ ...request, disposition: prior }, ctx);
       const published = await f.read();
@@ -281,7 +285,7 @@ test("failed binding or hand-back publication leaves disk control unchanged and 
   assert.equal((await f.read()).status, "paused");
 });
 
-test("hand_back schema defaults arrays and requires an explicit nonblank instruction", async (t) => {
+test("hand_back defaults arrays and requires instructions except for active completion", async (t) => {
   const f = await fixture(t);
   const handBack = handBackTool(f.state);
   const schema = tool.schema.object(handBack.args);
@@ -289,7 +293,7 @@ test("hand_back schema defaults arrays and requires an explicit nonblank instruc
   assert.match(handBack.args.userInstruction.description, /quote the user's explicit instruction/);
   await readTaskTool(f.state).execute({}, ctx);
   for (const change of [
-    { userInstruction: undefined }, { userInstruction: "" }, { userInstruction: "   " },
+    { userInstruction: "" }, { userInstruction: "   " },
     { disposition: "complete" }, { summary: undefined }, { checks: [1] }, { risks: "none" },
   ]) {
     const invalid = { ...request, ...change };
@@ -297,4 +301,21 @@ test("hand_back schema defaults arrays and requires an explicit nonblank instruc
     await assert.rejects(handBack.execute(invalid, ctx));
   }
   assert.equal((await f.read()).status, "active");
+  await assert.rejects(handBack.execute({ ...request, userInstruction: undefined }, ctx), /userInstruction/);
+  const completed = { disposition: "completed", summary: "Research complete. No task changes to commit." };
+  assert.deepEqual(schema.parse(completed), { ...completed, checks: [], risks: [] });
+  await assert.rejects(handBack.execute(completed, { sessionID: "other" }), /another sessionID/);
+  await handBack.execute(request, ctx);
+  await assert.rejects(handBack.execute(completed, ctx), /userInstruction.*paused/);
+  await f.write({ ...await f.read(), status: "active", generation: 2 });
+  await assert.rejects(handBack.execute(completed, ctx), /generation changed/);
+  await readTaskTool(f.state).execute({}, ctx);
+  await handBack.execute(completed, ctx);
+  const saved = await f.read();
+  assert.equal(saved.status, "completed");
+  assert.equal(saved.userInstruction, undefined, "automatic completion does not retain a prior pause instruction");
+  assert.equal(saved.summary, completed.summary);
+  assert.match(await handBack.execute(completed, ctx), /already reported/);
+  assert.deepEqual(await f.read(), saved);
+  assert.match(await readTaskTool(await consume(f.jobDir)).execute({}, ctx), /Status: completed/);
 });
