@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
     "target": "es2022",
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
     "module": "esnext",
     "moduleResolution": "bundler",
     "lib": ["es2023"],

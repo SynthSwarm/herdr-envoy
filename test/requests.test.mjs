@@ -40,7 +40,9 @@ async function fixture(t) {
     },
   }, tui: { showToast: async () => ({}) } };
   const coordinator = new Coordinator(shell, client, dir);
-  const receiver = existingRequests(shell, client, dir);
+  const displays = [];
+  const display = async (...args) => { displays.push(structuredClone(args)); };
+  const receiver = existingRequests(shell, client, dir, undefined, display);
   t.after(async () => {
     await receiver.dispose();
     await coordinator.dispose();
@@ -58,7 +60,7 @@ async function fixture(t) {
     return id;
   };
   const file = (id, name) => path.join(dir, "herdr-envoy", "sessions", id, FILES[name]);
-  return { dir, pane, calls, posts, receipts, options, coordinator, receiver, enqueue, file, client, shell };
+  return { dir, pane, calls, posts, receipts, options, coordinator, receiver, enqueue, file, client, shell, displays, display };
 }
 
 test("existing local requests wait while busy, preserve persona and hand back without owning resources", async (t) => {
@@ -89,6 +91,24 @@ test("existing local requests wait while busy, preserve persona and hand back wi
   const listing = JSON.parse(await f.coordinator.listSessions("owner-session"));
   assert.equal(listing[0].existingAgent, true);
   assert.equal(listing[0].requestDelivered, true);
+});
+
+test("sidebar follows queued, active and completed requests without including another conversation", async (t) => {
+  const f = await fixture(t);
+  const id = await f.enqueue();
+  await f.receiver.tick();
+  assert.equal(f.displays.at(-1)[3][0].existing.delivered, undefined);
+  f.pane.agent_status = "idle";
+  await f.receiver.tick();
+  await f.receiver.tick();
+  assert.equal(f.displays.at(-1)[3][0].existing.delivered, true);
+  await f.receiver.hand_back.execute({ jobId: id, disposition: "completed", summary: "Reviewed" }, { sessionID: "target-session" });
+  await f.receiver.tick();
+  assert.deepEqual(f.displays.at(-1)[3], []);
+  await f.enqueue();
+  f.pane.agent_session.value = "replacement";
+  await f.receiver.tick();
+  assert.deepEqual(f.displays.at(-1)[3], []);
 });
 
 test("current conversation settings deliver after a long turn without reading message history", async (t) => {
@@ -208,7 +228,7 @@ test("queued request survives receiver restart and socket or terminal mismatch c
   f.pane.terminal_id = "target-terminal";
   await f.receiver.dispose();
   // A fresh receiver must discover persisted state rather than an in-memory queue.
-  const receiver = existingRequests(f.shell, f.client, f.dir);
+  const receiver = existingRequests(f.shell, f.client, f.dir, undefined, f.display);
   await receiver.tick();
   await receiver.dispose();
   assert.equal(f.posts.length, 1);

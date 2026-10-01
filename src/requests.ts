@@ -5,6 +5,7 @@ import { tool, type PluginInput } from "@opencode-ai/plugin";
 import { consume, handBackTool, readTaskTool, recoverInteractivePeer, type DelegateState } from "./delegate.js";
 import { atomicWriteJSON, FILES, readJSON, sessionRoot, withSessionLock, type InteractiveSession } from "./protocol.js";
 import { lifecycle } from "./log.js";
+import { queueDisplay } from "./sidebar.js";
 
 const z = tool.schema;
 // Current session settings are returned at runtime but absent from the older SDK's Session type.
@@ -17,10 +18,11 @@ const metadata = z.object({
   existing: z.object({ sessionID: z.string(), messageID: z.string(), socket: z.string(), terminalID: z.string(), delivered: z.boolean().optional(), attemptedAt: z.number().optional(), cancelled: z.boolean().optional() }),
 }).passthrough();
 
-export function existingRequests($: PluginInput["$"], client: PluginInput["client"], directory: string, delegate?: DelegateState) {
+export function existingRequests($: PluginInput["$"], client: PluginInput["client"], directory: string, delegate?: DelegateState, display = queueDisplay()) {
   let stopped = false;
   let scan: Promise<void> | undefined;
   const recovered = new Map<string, DelegateState>();
+  let displayed = false;
   const load = async (jobId: string, sessionID: string) => {
     if (!/^[a-f0-9]{32}$/.test(jobId)) throw new Error("Invalid request ID");
     const dir = path.join(sessionRoot(), jobId);
@@ -103,15 +105,21 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
             parsed.data.existing.socket === process.env.HERDR_SOCKET_PATH && parsed.data.worktree === directory) jobs.push(parsed.data);
       }
       jobs.sort((a, b) => a.createdAt - b.createdAt || a.jobId.localeCompare(b.jobId));
-      if (!jobs.length) return;
+      if (!jobs.length && !displayed) return;
       const panes = JSON.parse(await $`herdr agent list`.text()).result?.agents;
       const pane = Array.isArray(panes) ? panes.find((p) => p.pane_id === process.env.HERDR_PANE_ID) : undefined;
       if (pane?.agent !== "opencode" || pane.agent_session?.agent !== "opencode" || pane.agent_session?.kind !== "id") return;
+      const pending = [];
       for (const job of jobs) {
         if (job.existing.sessionID !== pane.agent_session.value || job.existing.terminalID !== pane.terminal_id) continue;
         if (job.existing.cancelled) continue;
         const state = await readJSON<InteractiveSession>(path.join(sessionRoot(), job.jobId, FILES.session));
         if (state.status !== "active") continue;
+        pending.push(job);
+      }
+      await display(pane.pane_id, pane.agent_session.value, pane.agent_status, pending);
+      displayed = pending.length > 0;
+      for (const job of pending) {
         // One outstanding request per target. Handback releases the next queued request.
         if (job.existing.delivered) return;
         await withSessionLock(job.jobId, async () => {

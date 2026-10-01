@@ -6,6 +6,14 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.jsx"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
@@ -41,6 +49,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
     "test:bun": "npm run build && bun test test/bun-shell.test.ts",
+    "test:tui": "npm run build && bun --conditions=browser test test/tui.test.ts",
     "test:coverage": "npm run build && node --test --experimental-test-coverage --test-coverage-include='dist/*.js' --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=95 test/*.test.mjs",
     "prepack": "npm run build"
   },
@@ -49,7 +58,9 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.4",
+    "@opentui/solid": "0.4.5",
     "@types/node": "^26.1.1",
+    "solid-js": "1.9.12",
     "typescript": "^5.6.0"
   },
   "engines": {

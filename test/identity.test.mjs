@@ -64,4 +64,15 @@ test("discovery joins verified owned identity, redacts remotes, and leaves other
   assert.notEqual(replaced.identity, owned.identity);
   agent.agent_session = null;
   assert.equal(JSON.parse(await tool.execute({}, ctx)).machines[0].agents[0].identity, null);
+  const failingGit = listAgentsTool(async (program, args) => {
+    if (program === "git") throw new Error("not a repository");
+    return run(program, args);
+  });
+  assert.equal(JSON.parse(await failingGit.execute({}, ctx)).machines[0].agents[0].gitStatus, "unavailable");
+  const readdir = fs.readdir;
+  t.mock.method(fs, "readdir", async (...args) => {
+    if (args[0] === sessionRoot()) throw Object.assign(new Error("denied"), { code: "EACCES" });
+    return readdir(...args);
+  });
+  await assert.rejects(tool.execute({}, ctx), /denied/);
 });

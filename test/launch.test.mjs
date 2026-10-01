@@ -27,9 +27,17 @@ test("real direnv loads the destination .env before starting OpenCode and refuse
   await exec("direnv", ["allow", dir]);
   assert.equal(await launchAgent(dir, []), 0);
   assert.equal(await fs.readFile(path.join(dir, "started"), "utf8"), "success");
+  const launcher = path.resolve("dist/launch.js");
+  await exec(process.execPath, [launcher, dir]);
   await fs.unlink(path.join(dir, "started"));
   await fs.writeFile(path.join(dir, ".envrc"), "echo private-secret >&2\nexit 1\n");
   await exec("direnv", ["allow", dir]);
   await assert.rejects(launchAgent(dir, []), /environment loading failed/);
+  await assert.rejects(exec(process.execPath, [launcher, dir]), (error) => {
+    assert.match(error.stderr, /environment preparation or agent launch failed/);
+    assert.doesNotMatch(error.stderr, /private-secret/);
+    return true;
+  });
+  await assert.rejects(exec(process.execPath, [launcher]));
   await assert.rejects(fs.access(path.join(dir, "started")), { code: "ENOENT" });
 });

@@ -68,6 +68,57 @@ original delivery binding and explicit request ID. Missing or ambiguous peer ide
 with recovery guidance. `list_sessions` remains an owner-scoped coordinator list, not a peer
 identity lookup. Successful tool-side recovery records a redacted `peer_recovered` lifecycle event.
 
+### Request Sidebar
+
+**OpenCode inbox/outbox.** The separate TUI entrypoint adds a read-only Envoy block between LSP
+and Todo. Configure the package in `tui.json`'s `plugin` array, or for the local sync installation:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["./plugins/herdr-envoy-dist/tui.jsx"]
+}
+```
+
+Restart OpenCode after configuration changes. TUI plugins are not auto-discovered. This entrypoint
+requires the OpenCode TUI slot API (tested against 1.18.27); it is separate from the server plugin.
+It reads the same local Envoy state directory and does not support attaching to a server whose
+state files live on a different machine. Inbox matches the viewed conversation and working
+directory; outbox matches the originating coordinator conversation and directory. Existing-agent
+requests and owned delegations are included, with active items first and recent reports retained.
+Each side shows up to three entries. Click Envoy to collapse the whole block, or Inbox/Outbox
+to collapse either section; counts remain visible. Click Browse all to browse entries, or an entry for its
+full ID, state, peer/folder, enqueue time and summary/checks/risks. Full task briefs and tokens are
+not exposed. No clicks send, cancel, resume, commit or reap work. Missing/corrupt data is reported
+as incomplete rather than silently presented as a complete empty queue. Refresh is every two
+seconds and stops when the component unmounts. Run `npm run test:tui` with Bun for renderer tests;
+the Node suite covers the read-only mailbox projection, not JSX rendering.
+
+**Herdr agent overview.**
+
+The recipient publishes display-only pane metadata under source `herdr-envoy` while requests
+are outstanding. It does not rename the agent or override herdr's execution state. Add these
+rows to your existing `[ui.sidebar.agents]` `rows` array in herdr's config, then run
+`herdr config check` and `herdr server reload-config`:
+
+```toml
+[{ token = "$envoy_queue", fg = "#e5c07b", bold = true }],
+[{ token = "$envoy_request", fg = "#abb2bf" }],
+[{ token = "$envoy_wait", fg = "#98c379" }]
+```
+
+Example: `Req 1 active 1 queued`, `90371d34 from tmp`, `Awaiting handback`.
+`active` means delivered and not yet handed back, not necessarily currently executing.
+Attempted-but-unconfirmed submissions are counted separately with `?` and are not ordinary
+queued requests. Metadata also exposes `envoy_active`, `envoy_queued`, `envoy_uncertain`,
+`envoy_request_id` (full ID), `envoy_sender` (coordinator pane) and `envoy_since` (UTC enqueue
+time). The displayed request is the oldest active request, then uncertain, then queued.
+Only directory basenames and request/routing metadata are shown, never task bodies or reports.
+Completed, paused, commit/discard and cancelled requests leave the outstanding display.
+Reports refresh at most every ten seconds when unchanged and expire after thirty seconds
+without refresh. Empty queues clear only Envoy's tokens. Sidebar failures do not block delivery.
+The plugin does not automatically rewrite herdr configuration.
+
 ### Coordinator tools (in your normal sessions)
 
 **Standalone working folders.** `open_session` also accepts `placement: "workspace"`, with
