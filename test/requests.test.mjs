@@ -91,6 +91,35 @@ test("existing local requests wait while busy, preserve persona and hand back wi
   assert.equal(listing[0].requestDelivered, true);
 });
 
+test("current conversation settings deliver after a long turn without reading message history", async (t) => {
+  const f = await fixture(t);
+  await f.enqueue();
+  f.pane.agent_status = "idle";
+  f.client.session.get = async () => ({ data: { id: "target-session", directory: f.dir,
+    agent: "selected-persona", model: { id: "selected-model", providerID: "selected-provider", variant: "xhigh" } } });
+  f.client.session.messages = async () => assert.fail("Current settings should not require history");
+  await f.receiver.tick();
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].body.agent, "selected-persona");
+  assert.deepEqual(f.posts[0].body.model, { modelID: "selected-model", providerID: "selected-provider" });
+  assert.equal(f.posts[0].body.variant, "xhigh");
+});
+
+test("older sessions find the last user settings beyond twenty assistant messages", async (t) => {
+  const f = await fixture(t);
+  await f.enqueue();
+  f.pane.agent_status = "idle";
+  f.client.session.messages = async (request) => {
+    const data = [{ info: { role: "user", agent: "earlier-persona", model: { providerID: "p", modelID: "m" }, variant: "high" } },
+      ...Array.from({ length: 30 }, () => ({ info: { role: "assistant" } }))];
+    return { data: request.query.limit ? data.slice(-request.query.limit) : data };
+  };
+  await f.receiver.tick();
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].body.agent, "earlier-persona");
+  assert.equal(f.posts[0].body.variant, "high");
+});
+
 test("one outstanding request gates later requests until handback", async (t) => {
   const f = await fixture(t);
   const first = await f.enqueue();

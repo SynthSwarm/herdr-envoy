@@ -6,6 +6,11 @@ import { consume, handBackTool, readTaskTool, type DelegateState } from "./deleg
 import { atomicWriteJSON, FILES, readJSON, sessionRoot, withSessionLock, type InteractiveSession } from "./protocol.js";
 
 const z = tool.schema;
+// Current session settings are returned at runtime but absent from the older SDK's Session type.
+const sessionSettings = z.object({
+  agent: z.string().min(1),
+  model: z.object({ id: z.string().min(1), providerID: z.string().min(1), variant: z.string().optional() }),
+});
 const metadata = z.object({
   jobId: z.string().regex(/^[a-f0-9]{32}$/), pane: z.string(), worktree: z.string(), createdAt: z.number(),
   existing: z.object({ sessionID: z.string(), messageID: z.string(), socket: z.string(), terminalID: z.string(), delivered: z.boolean().optional(), attemptedAt: z.number().optional(), cancelled: z.boolean().optional() }),
@@ -40,6 +45,17 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
       if (!jobId && !delegate) throw new Error("Specify the jobId from the queued request");
       const state = jobId ? await load(jobId, ctx.sessionID) : delegate!;
       const text = await readTaskTool(state).execute({}, ctx);
+      if (!jobId && state.consumed && ctx?.sessionID) {
+        await withSessionLock(state.consumed.jobId, async () => {
+          const file = path.join(state.jobDir, "agent-session.json");
+          const saved = await readJSON<{ sessionID: string }>(file).catch((error) => {
+            if (error.code === "ENOENT") return null;
+            throw error;
+          });
+          if (saved && saved.sessionID !== ctx.sessionID) throw new Error("Agent identity belongs to another conversation");
+          if (!saved) await atomicWriteJSON(file, { sessionID: ctx.sessionID });
+        }, 100);
+      }
       return jobId ? `This is a request alongside your existing work, not a transfer of your conversation or checkout. Keep the request scoped to its brief. Use jobId=${jobId} for its hand_back.\n\n${text}` : text;
     },
   });
@@ -104,9 +120,24 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
           if (current.existing.attemptedAt || receipt.data) return;
           const status = await client.session.status({ ...options, throwOnError: true });
           if (status.data?.[id] && status.data[id].type !== "idle") return;
-          const messages = await client.session.messages({ ...options, path: { id }, query: { directory, limit: 20 }, throwOnError: true });
-          const user = messages.data?.findLast((m) => m.info.role === "user")?.info;
-          if (!user || user.role !== "user") return;
+          const settings = sessionSettings.safeParse(conversation.data);
+          let agent: string;
+          let model: { providerID: string; modelID: string };
+          let variant: string | undefined;
+          if (settings.success) {
+            agent = settings.data.agent;
+            model = { providerID: settings.data.model.providerID, modelID: settings.data.model.id };
+            variant = settings.data.model.variant;
+          } else {
+            // Older OpenCode versions do not report settings on the session. A long turn can
+            // contain more than 20 assistant messages, so do not truncate the fallback history.
+            const messages = await client.session.messages({ ...options, path: { id }, throwOnError: true });
+            const user = messages.data?.findLast((m) => m.info.role === "user")?.info;
+            if (!user || user.role !== "user") return;
+            agent = user.agent;
+            model = user.model;
+            variant = z.object({ variant: z.string().optional() }).parse(user).variant;
+          }
           const statusNow = await client.session.status({ ...options, throwOnError: true });
           if (stopped || (statusNow.data?.[id] && statusNow.data[id].type !== "idle")) return;
           // Assign ordering at delivery, not enqueue time, after the preceding turn.
@@ -114,10 +145,11 @@ export function existingRequests($: PluginInput["$"], client: PluginInput["clien
           current.existing.attemptedAt = Date.now();
           await atomicWriteJSON(file, current);
           // Keep the target's current persona/model; never inject input into its terminal.
-          await client.session.promptAsync({ ...options, path: { id }, body: {
-            messageID: current.existing.messageID, agent: user.agent, model: user.model,
-            parts: [{ type: "text", text }],
-          }, throwOnError: true });
+          const body = {
+            messageID: current.existing.messageID, agent, model, variant,
+            parts: [{ type: "text" as const, text }],
+          };
+          await client.session.promptAsync({ ...options, path: { id }, body, throwOnError: true });
           const submitted = await client.session.message({ ...options, path: { id, messageID: current.existing.messageID } });
           if (submitted.data?.parts.some((p) => p.type === "text" && p.text === text)) {
             current.existing.delivered = true;

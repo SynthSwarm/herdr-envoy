@@ -56,6 +56,51 @@ opencode to load the changes.
 
 ### Coordinator tools (in your normal sessions)
 
+**Standalone working folders.** `open_session` also accepts `placement: "workspace"`, with
+`repo` pointing to an existing absolute working folder and branch/base/target arguments omitted.
+It opens an independent herdr workspace directly in that folder, including non-Git folders.
+No clone, branch or worktree is created. Envoy owns the workspace/process, never the folder or
+its branches. Reap can close its workspace after handback, but refuses discard/deleteBranch.
+When asked to contact another project's agent, discover first; if absent, ask for the working
+folder rather than creating a worktree under the coordinator's project.
+
+**Environment preparation.** Every newly launched process uses the bundled Node launcher to
+wait for `direnv export json` in its destination directory before spawning OpenCode. Node and
+direnv must be installed. Export has a two-minute timeout and failure prevents OpenCode startup;
+environment output/errors are not printed. `direnv allow` errors also prevent launch. A shell
+readiness delay is only a terminal-input precaution, not an environment-readiness check.
+Root `.env` and `.envrc` are copied into newly created worktrees with private permissions. Sources
+and destinations must be regular files; conflicting files are not overwritten. `.env` must be
+Git-ignored. An `.env` without `.envrc` is refused: configure its loading explicitly, commonly
+with `dotenv .env`. Other referenced files are not copied automatically. Standalone folders use
+their own environment, and reopening does not overwrite worktree environment edits. Requests
+to already-running agents do not reload their environment. Authorising `.envrc` executes the
+selected project's code, so use trusted projects. Launch submission still is not proof that the
+agent started: a runner failure retains the interactive session for inspection/startup timeout.
+
+**Agent identities.** `list_agents` refreshes machine/agent discovery and adds `identity`,
+`ownership`, `observedAt`, and local Git repository/remotes (credentials and URL query/fragment
+data are removed). Remote Git context is explicitly `not_inspected`; unavailable local Git
+context is not proof that a directory is not a repository. Directory, remote and status are
+attributes, never identity keys. Unknown conversations have no targetable identity.
+
+New owned agents receive a persisted readable reference, such as `access-review-a1b2c3d4e5f6`,
+derived from the session name (or repository/persona) and a job-ID suffix. Pane placement labels
+the new pane before launching OpenCode; child-workspace placement uses the reference as its
+workspace label, including reopening. The parent workspace and discovered agents are never
+renamed. `read_task` binds the owned identity to the conversation. Discovery recognises owned
+agents only when socket, terminal, conversation and checkout match persisted metadata, including
+a pane moved within the same server. Other live agents use a machine/session-scoped conversation
+reference. Existing jobs without identity metadata keep their previous labels and job-ID access.
+
+Use `request_agent({identity, task})` with a fresh `list_agents` result. Envoy resolves the current
+local pane and conversation and rechecks the conversation before queueing. Remote identities,
+ambiguous identities and identities without a live conversation are refused. The shipped
+`paneId`/`sessionId` form remains supported, but cannot be mixed with `identity`. Owned references
+also work in the `jobId` selector for reap, reply and resume; normal owner/cleanup checks still
+apply. Discovery ownership is not permission to reap another coordinator's job. Identity
+discovery is on demand, not a background registry or a new CLI in this release.
+
 **`list_machines`** is read-only discovery, with no arguments. It lists Local (the calling
 herdr session, `id: null`) and saved SSH machines, including each machine's live OpenCode
 agents, pane/workspace IDs, name when available, state, working directory, terminal title and
@@ -79,7 +124,8 @@ directory. It records the exact herdr socket, terminal, pane, conversation and w
 It creates no worktree, changes no branch, sends no terminal input and takes no ownership of
 the recipient's resources. The recipient polls its persisted inbox every two seconds, waits for
 herdr idle/done and OpenCode idle, and submits through its own OpenCode client with the existing
-persona/model. One outstanding request per conversation waits for explicit handback before the
+persona/model/variant from the conversation settings (falling back to user-message history on
+older OpenCode versions). One outstanding request per conversation waits for explicit handback before the
 next is delivered. Requests for missing/replaced panes or conversations stay queued.
 
 The recipient calls `read_task({jobId})` and `hand_back({jobId, disposition, summary, checks,

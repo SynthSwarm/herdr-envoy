@@ -11,17 +11,16 @@ export const SKILL_NAME = "envoy";
 
 const SKILL_MD = `---
 name: envoy
-description: Delegate bounded tasks or open durable interactive sessions with real peer opencode agents in isolated Git worktrees. Use for delegation, parallel work, or opening and resuming an attachable peer session in a pane or child workspace. Requires herdr and herdr-envoy (delegate, open_session, list_sessions, resume_session, reply_delegate and reap_delegate tools).
+description: Discover and coordinate OpenCode agents with herdr. Use for delegation, queued requests to existing local agents, isolated worktrees, or interactive sessions in panes, child workspaces and standalone working folders.
 license: MIT
 compatibility: opencode
 ---
 
 # envoy (coordinator)
 
-You are a delegation **coordinator**. Peers are real separate opencode processes with their own
-Git worktree and branch, not subagents. Choose a bounded task or a durable interactive session
-independently of placement: both support a pane or a child workspace. Use them for isolated
-edits, parallel fan-out or interactive work that the user can pause and resume.
+You are a delegation **coordinator**. Peers are separate OpenCode processes, not subagents.
+Use an existing agent when it fits, an isolated worktree for parallel changes, or a standalone
+workspace when the user wants an agent working directly in another project folder.
 
 The herdr-envoy plugin gives you the tools. You do NOT manage panes/worktrees yourself.
 
@@ -35,6 +34,29 @@ The herdr-envoy plugin gives you the tools. You do NOT manage panes/worktrees yo
 - Prefer this over a subagent when you want a real, separate, attachable session.
 
 ## Choose lifecycle and placement
+Treat these as intent cues, not keyword matching. Ask briefly when the destination is unclear;
+otherwise use the context already given rather than asking the user to repeat it.
+
+- "Ask the entlz agent": discover with \`list_agents\` first. Queue to a unique match even if
+  busy. If no agent exists, ask for its working folder, then use \`open_session\` with
+  \`placement: "workspace"\`, \`repo\` set to that existing absolute folder, and no branch/base/target.
+  A machine being unavailable does not mean the agent is absent. Agent identity/name is distinct
+  from the OpenCode persona in \`agent\` (for example build).
+- "Beside me", "split a pane", "same workspace", "no new workspace": prefer \`pane\`.
+- "Child workspace", "separate worktree workspace", "don't split this view": prefer
+  \`subworkspace\` when isolated worktree work is intended.
+- "Own working folder", "open the project at ...", "standalone workspace": \`workspace\`.
+  This uses the supplied folder directly, not a clone or worktree. Envoy may close the workspace
+  it creates but never deletes that folder or its branches.
+- "Background", "parallel", "isolated" alone do not imply a child workspace. Both isolated
+  placements create worktrees; default to \`pane\` when there is no other preference. Respect
+  negation, and clarify tab/window requests instead of silently choosing a different topology.
+
+Prefer \`list_agents\` for identity references, live state and local Git context. New agents'
+references are also their pane or child-workspace labels. Use \`request_agent({identity, task})\`
+with fresh discovery instead of pane IDs. Owned references work as jobId selectors for
+reap/reply/resume, subject to existing ownership checks. Never guess ambiguous or remote targets.
+
 For an existing LOCAL OpenCode agent, use \`request_agent({paneId, sessionId, task})\` from the Local
 discovery inventory. Both sessions need the updated plugin. Requests wait for idle and earlier
 requests' handback; no terminal input, new checkout or ownership takeover. The recipient uses
@@ -45,8 +67,8 @@ requestAttemptedAt and requestCancelled. An attempted but unconfirmed delivery i
 agents cannot be reaped or resumed as owned sessions. Do not pass a remote pane ID.
 
 Use \`delegate\` for bounded work with a terminal completion report. Use \`open_session\` for
-durable interactive work. Neither lifecycle determines placement: both tools accept
-\`placement: "pane" | "subworkspace"\`, defaulting to \`pane\`.
+durable interactive work. Both tools support \`pane\` and \`subworkspace\`, defaulting to
+\`pane\`; \`open_session\` additionally supports \`workspace\` for an existing working folder.
 
 Resolve these creation arguments first:
 - \`agent\`: which of the USER'S OWN agents runs the task. Ask if unclear — never invent one.
@@ -54,14 +76,14 @@ Resolve these creation arguments first:
 - \`task\`: complete, self-contained instructions. The delegate starts with NO context, so include
   everything it needs. Do not reference files it can't see.
 - \`repo\`: absolute path to the repository.
-- \`branch\`: a fresh branch, e.g. \`delegate/<short-slug>\`.
+- \`branch\`: a fresh branch for isolated placements; omit for \`workspace\`.
 - \`baseCommit\`: optional base, resolved to a commit SHA. Defaults to source repository HEAD.
 - \`targetBranch\`: optional intended merge target, never permission to merge.
-- \`placement\`: \`pane\` (default) or \`subworkspace\`.
+- \`placement\`: \`pane\` (default), \`subworkspace\`, or \`workspace\` for an interactive working-folder session.
 
 \`open_session\` also takes \`name\`, a display label, not a unique identifier. Its arguments are
 \`agent\`, \`task\`, \`name\`, \`repo\`, \`branch\`, optional \`baseCommit\`, optional \`targetBranch\`
-and \`placement\`. It does not take bounded output or merge contracts.
+and \`placement\`. For \`workspace\`, omit branch/base/target. It does not take bounded output or merge contracts.
 
 For bounded \`delegate\` only:
 - \`outputContract\`: \`advisory\` (analysis/answer, no commits) or \`code-change\` (commits).
@@ -80,6 +102,19 @@ to open that repository in herdr. Never substitute the caller's workspace.
 Both peers read the persisted brief with \`read_task\`, not the already-consumed \`handoff.json\`.
 Bounded peers report with \`complete\` and ask questions with \`ask\`. Interactive peers expose
 \`read_task\` and \`hand_back\` only, with NO \`complete\` or \`ask\`.
+
+## Environment before launch
+Every new OpenCode process, including a reopened session, must start only after the destination's
+direnv environment loads successfully. Envoy copies root \`.env\` and \`.envrc\` into new worktrees,
+uses private permissions, runs \`direnv allow\`, then loads the environment inside the destination
+pane before spawning OpenCode. Standalone folders use their own files without copying from the
+coordinator's project. A running agent keeps its environment; requesting work does not reload it.
+
+Do not print environment contents or commit secrets. Copying requires regular files, no conflicting
+destination content, and Git must ignore \`.env\`. If setup fails, resolve the reported issue rather
+than launching with a partial environment. An \`.env\` needs an \`.envrc\` that loads it (usually
+\`dotenv .env\`). Trust only the user-selected project's environment; \`.envrc\` executes code.
+Shell-prompt visibility or a fixed delay is not evidence that environment loading succeeded.
 
 ## Monitoring and review
 Jobs bind to the tool context's \`sessionID\`. \`coordinator.json\` persists that owner, the project

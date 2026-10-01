@@ -9,6 +9,7 @@ import { provisionSkill } from "./skill.js";
 import { listMachinesTool } from "./discovery.js";
 import { existingRequests } from "./requests.js";
 import { tool } from "@opencode-ai/plugin";
+import { listAgentsTool } from "./identity.js";
 
 export const PeerDelegate: Plugin = async ({ $, client, directory }) => {
   const delegateJobDir = process.env[JOBDIR_ENV];
@@ -57,10 +58,29 @@ export const PeerDelegate: Plugin = async ({ $, client, directory }) => {
   const hooks: Hooks = {
     tool: {
       list_machines: listMachinesTool(),
+      list_agents: listAgentsTool(),
       request_agent: tool({
         description: "Queue a request for an existing local OpenCode pane. Requires the updated Envoy plugin in the target. No terminal input, abort, remote targeting or resource ownership transfer. Delivery waits for idle and earlier requests' handback; a simultaneous user submission can race the idle check.",
-        args: { paneId: tool.schema.string(), sessionId: tool.schema.string().describe("Expected conversation ID from Local discovery, checked before enqueueing."), task: tool.schema.string().min(1) },
-        execute: ({ paneId, sessionId, task }, ctx) => coord.requestAgent(paneId, task, ctx.sessionID, sessionId),
+        args: {
+          identity: tool.schema.string().optional().describe("Agent identity from list_agents. Resolves its current local pane and conversation."),
+          paneId: tool.schema.string().optional().describe("Legacy explicit pane target. Use identity instead."),
+          sessionId: tool.schema.string().optional().describe("Required with paneId: expected conversation ID."),
+          task: tool.schema.string().min(1),
+        },
+        async execute({ identity, paneId, sessionId, task }, ctx) {
+          if (identity) {
+            if (paneId || sessionId) throw new Error("Use identity or paneId/sessionId, not both");
+            const raw = await listAgentsTool().execute({}, ctx);
+            const inventory = JSON.parse(typeof raw === "string" ? raw : raw.output);
+            const matches = inventory.machines.filter((m: { id: string | null }) => m.id === null)
+              .flatMap((m: { agents?: { identity: string; paneId: string; sessionId: string }[] }) => m.agents ?? [])
+              .filter((a: { identity: string }) => a.identity === identity);
+            if (matches.length !== 1 || !matches[0].sessionId) throw new Error("No unique live local conversation for this identity. Refresh list_agents.");
+            ({ paneId, sessionId } = matches[0]);
+          }
+          if (!paneId || !sessionId) throw new Error("Specify an identity, or both paneId and sessionId");
+          return coord.requestAgent(paneId, task, ctx.sessionID, sessionId);
+        },
       }),
       cancel_request: tool({
         description: "Retire an existing-agent request from its delivery queue. Does not interrupt or retract already-submitted work or touch the agent's resources. Use to release a stuck or unwanted request.",

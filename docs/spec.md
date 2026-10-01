@@ -9,6 +9,19 @@ handback is user-directed, with review, checks and commit before commit-disposit
 
 ## Roles and Ownership
 
+- New owned jobs persist an `identity` reference and herdr socket/terminal metadata. The reference
+  is the new pane label before launch, or the child workspace label at creation/reopen. Parent
+  workspaces and discovered agents are not renamed. Failure to label a fresh pane prevents launch.
+- `read_task` persists `agent-session.json` to bind the owned reference to its OpenCode conversation.
+  `list_agents` performs on-demand discovery and matches owned metadata by socket, terminal,
+  conversation and checkout. Other agents receive machine/session-scoped conversation references.
+  Git remotes, directories, labels and status are attributes, not identity keys. Remote Git details
+  are not inspected. Missing conversation identity is not a targetable agent.
+- `request_agent` accepts `identity` instead of `paneId`/`sessionId`, resolves fresh local inventory
+  and then verifies the conversation using the existing queue path. Mixed selectors are refused.
+  Existing explicit selectors remain supported. Owned references resolve through existing
+  owner-scoped job selectors. No ownership is inferred from labels or matching Git remotes.
+
 - `list_machines` discovers Local and saved SSH profiles with live OpenCode agents. Disabled
   profiles are not contacted, unavailable inventories are not empty, and IDs are machine-scoped.
 - `request_agent({paneId, sessionId, task})` queues a request to an existing local OpenCode
@@ -16,7 +29,8 @@ handback is user-directed, with review, checks and commit before commit-disposit
   and persists the brief and interactive control in the durable session root. It does not
   create or own a checkout, branch, pane or conversation. Both processes need the updated plugin.
 - The recipient's plugin polls its inbox, serialises delivery per pane, and submits only after
-  herdr idle/done and OpenCode idle checks, preserving the prior user message's persona/model.
+  herdr idle/done and OpenCode idle checks, preserving the current conversation's persona/model/
+  variant, with user-message history as a fallback for older OpenCode versions.
   One request remains outstanding until explicit handback. Idle checking and legacy API
   submission are not atomic against concurrent user input. No abort or terminal input is used.
 - All roles expose request-aware `read_task({jobId})` and `hand_back({jobId, ...})`. Omitting
@@ -49,6 +63,19 @@ handback is user-directed, with review, checks and commit before commit-disposit
   does not grant a different orchestrator session ownership, listing access or resume rights.
 
 ## Creation and Launch
+
+- `open_session` supports `placement: workspace` for an existing absolute working folder,
+  including non-Git folders. Branch/base/target arguments are refused. It creates a standalone
+  labelled workspace, not a child worktree. Cleanup owns only that workspace, never the supplied
+  folder or branches. Destructive discard and deleteBranch are refused for this placement.
+- New worktrees receive private root `.env`/`.envrc` copies when present. Symlinks, conflicting
+  destination content and non-ignored `.env` are refused. Reopening does not recopy them.
+  Standalone folders use their existing files. `.env` without `.envrc` requires explicit setup.
+- `direnv allow` is awaited and failure is fatal. The destination pane runs the bundled Node
+  launcher, which waits for `direnv export json`, applies its environment diff, then spawns
+  OpenCode. Export failure/timeout prevents spawn; captured output is never disclosed. Prompt
+  detection/delay is not proof of environment loading. Live-agent requests cannot reload an
+  already-running process. Interactive launch failures retain resources after submission.
 
 - `repo` must be absolute, `HERDR_PANE_ID` and a session owner must be present, and the named
   user-owned agent must exist in the repository's opencode scope. Agent listing accepts

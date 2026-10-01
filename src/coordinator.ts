@@ -4,6 +4,7 @@
 import { promises as fs, watch, type FSWatcher } from "node:fs";
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { tool } from "@opencode-ai/plugin";
 const z = tool.schema;
 import type { PluginInput } from "@opencode-ai/plugin";
@@ -30,8 +31,12 @@ import {
 } from "./protocol.js";
 import { verify } from "./verify.js";
 import { lifecycle } from "./log.js";
+import { agentRef } from "./identity.js";
 
 interface Job {
+  identity?: string;
+  socket?: string;
+  terminalID?: string;
   jobId: string;
   directory: string;
   coordinatorPane: string;
@@ -332,8 +337,12 @@ export class Coordinator {
   // Resolve a full jobId from a full id or its 8-char short prefix.
   resolveJobId(idOrPrefix: string, sessionID?: string): string | undefined {
     const matches = [...this.jobs.keys()].filter((id) =>
-      idOrPrefix.length >= 8 && id.startsWith(idOrPrefix) && (!sessionID || this.jobs.get(id)?.sessionID === sessionID));
+      (this.jobs.get(id)?.identity === idOrPrefix || (idOrPrefix.length >= 8 && id.startsWith(idOrPrefix))) && (!sessionID || this.jobs.get(id)?.sessionID === sessionID));
     return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  agentIdentity(jobId: string): string | undefined {
+    return this.jobs.get(jobId)?.identity;
   }
 
   private async readSession(job: Job): Promise<InteractiveSession> {
@@ -355,6 +364,7 @@ export class Coordinator {
       if (job.existing) job = await readJSON<Job>(path.join(this.dir(job.jobId), FILES.coordinator));
       const state = await this.readSession(job);
       sessions.push({ jobId: job.jobId, name: job.name, status: state.status, phase: job.phase,
+        ...(job.identity ? { identity: job.identity } : {}),
         ...(job.existing ? { existingAgent: true, requestDelivered: Boolean(job.existing.delivered), requestAttemptedAt: job.existing.attemptedAt, requestCancelled: Boolean(job.existing.cancelled) } : {}),
         placement: job.placement, worktree: job.worktree, branch: job.branch,
         pane: job.pane, workspace: job.workspace, sessionID: state.sessionID, summary: state.summary,
@@ -400,8 +410,10 @@ export class Coordinator {
     }
     if (!state.sessionID) throw new Error("Saved conversation identity is missing; refusing to create a substitute");
     if (!(await exists(job.worktree))) throw new Error("Saved worktree is missing; refusing to create a substitute");
-    const branch = (await this.$`git -C ${job.worktree} symbolic-ref --short HEAD`.text()).trim();
-    if (branch !== job.branch) throw new Error("Saved worktree branch has changed");
+    if (job.placement !== "workspace") {
+      const branch = (await this.$`git -C ${job.worktree} symbolic-ref --short HEAD`.text()).trim();
+      if (branch !== job.branch) throw new Error("Saved worktree branch has changed");
+    }
     const conversation = await this.client.session.get({ path: { id: state.sessionID }, query: { directory: job.worktree }, throwOnError: true });
     if (conversation.data?.id !== state.sessionID || conversation.data.directory !== job.worktree) throw new Error("Saved conversation does not belong to this worktree");
     const panes = JSON.parse(await this.$`herdr pane list`.text()).result?.panes;
@@ -485,6 +497,7 @@ export class Coordinator {
     const job = this.jobs.get(jobId);
     if (!job) return;
     if (job.existing) throw new Error("Existing agents and their checkouts are not owned by Envoy and cannot be reaped.");
+    if (job.placement === "workspace" && (opts.discard || opts.deleteBranch)) throw new Error("Standalone folder and branches are user-owned; only the workspace can be closed");
     if (this.resumes.has(jobId)) throw new Error("Session is being resumed; retry cleanup afterwards");
     if (job.resourceUncertain) await this.reconcileCreation(job);
     if (opts.keepPane) throw new Error("Cannot remove a checkout while retaining its delegate pane");
@@ -548,6 +561,7 @@ export class Coordinator {
   }
 
   private async reconcileCreation(job: Job) {
+    if (job.placement === "workspace") throw new Error("Standalone workspace creation is uncertain; preserve resources for inspection");
     // Only clear uncertainty when independent inventories prove no resources exist.
     // An uncertain create may have targeted a different repo in older versions.
     const $ = this.$;
@@ -729,7 +743,7 @@ export class Coordinator {
     checks?: { command: string; expectedExitCode: number }[];
     startupTimeoutSeconds?: number;
     sessionID: string;
-    branch: string;
+    branch?: string;
     placement?: Placement;
     mode?: "interactive";
     name?: string;
@@ -738,10 +752,17 @@ export class Coordinator {
     if (!process.env.HERDR_PANE_ID) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
     if (!input.sessionID || !path.isAbsolute(input.repo)) throw new Error("A session owner and absolute repo path are required");
     await this.assertAgentExists(input.agent, input.repo);
-    await this.$`git -C ${input.repo} check-ref-format --branch ${input.branch}`.quiet();
-    const branchExists = await this.$`git -C ${input.repo} show-ref --verify --quiet ${`refs/heads/${input.branch}`}`.then(() => true).catch(() => false);
-    if (branchExists) throw new Error(`Branch already exists: ${input.branch}. Use a fresh branch.`);
-    const baseCommit = (await this.$`git -C ${input.repo} rev-parse --verify --end-of-options ${`${input.baseCommit ?? "HEAD"}^{commit}`}`.text()).trim();
+    let baseCommit = "";
+    if (input.placement === "workspace") {
+      if (input.mode !== "interactive" || input.branch || input.baseCommit || input.targetBranch) throw new Error("Standalone workspace requires interactive mode with no branch/base/target arguments");
+      if (!(await fs.stat(input.repo)).isDirectory()) throw new Error("Working folder must be an existing directory");
+    } else {
+      if (!input.branch) throw new Error("A fresh branch is required for isolated placement");
+      await this.$`git -C ${input.repo} check-ref-format --branch ${input.branch}`.quiet();
+      const branchExists = await this.$`git -C ${input.repo} show-ref --verify --quiet ${`refs/heads/${input.branch}`}`.then(() => true).catch(() => false);
+      if (branchExists) throw new Error(`Branch already exists: ${input.branch}. Use a fresh branch.`);
+      baseCommit = (await this.$`git -C ${input.repo} rev-parse --verify --end-of-options ${`${input.baseCommit ?? "HEAD"}^{commit}`}`.text()).trim();
+    }
     const jobId = rand();
     const dir = input.mode === "interactive" ? path.join(sessionRoot(), jobId) : jobDir(jobId);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -765,8 +786,9 @@ export class Coordinator {
     await atomicWriteJSON(path.join(dir, FILES.handoff), handoff);
     const job: Job = {
       jobId, directory: this.directory, coordinatorPane: process.env.HERDR_PANE_ID, sessionID: input.sessionID,
-      agent: input.agent, repo: input.repo, branch: input.branch, baseCommit,
-      worktree: path.join(input.repo, ".herdr-envoy", "worktrees", jobId),
+      identity: agentRef(input.name ?? `${path.basename(input.repo)}-${input.agent}`, jobId), socket: process.env.HERDR_SOCKET_PATH,
+      agent: input.agent, repo: input.repo, branch: input.branch ?? "", baseCommit,
+      worktree: input.placement === "workspace" ? input.repo : path.join(input.repo, ".herdr-envoy", "worktrees", jobId),
       createdAt: Date.now(), startupTimeoutSeconds: handoff.startupTimeoutSeconds,
       phase: "starting", delivered: [],
       ...(input.mode ? { mode: input.mode, name: input.name } : {}),
@@ -836,7 +858,7 @@ export class Coordinator {
 
   // Create worktree, split a pane in the current herdr workspace, boot the agent
   // with JOBDIR_ENV set so its plugin activates the delegate role.
-  async spawnDelegate(jobId: string, input: { agent: string; repo: string; branch: string; task: string; outputContract: "advisory" | "code-change"; startupTimeoutSeconds?: number }): Promise<{ pane: string; worktree: string }> {
+  async spawnDelegate(jobId: string, input: { agent: string; repo: string; branch?: string; task: string; outputContract: "advisory" | "code-change"; startupTimeoutSeconds?: number }): Promise<{ pane: string; worktree: string }> {
     return this.exclusive(jobId, () => this.spawn(jobId));
   }
 
@@ -863,7 +885,7 @@ export class Coordinator {
         throw new Error(`Launch may have started session ${jobId}; resources are preserved for inspection: ${error}`);
       }
       try {
-        await this.cleanup(jobId, { deleteBranch: true });
+        await this.cleanup(jobId, { deleteBranch: job.placement !== "workspace" });
       } catch (cleanupError) {
         throw new Error(`Job ${jobId} failed to launch: ${error}. Cleanup failed and remains tracked; retry reap_delegate: ${cleanupError}`);
       }
@@ -875,7 +897,21 @@ export class Coordinator {
     const $ = this.$;
     const caller = process.env.HERDR_PANE_ID;
     if (!caller) throw new Error("peer-delegate: HERDR_PANE_ID missing (not in a herdr session)");
-    if (job.placement === "subworkspace") {
+    if (job.placement === "workspace") {
+      if (reopen && job.workspace) {
+        const inventory = JSON.parse(await $`herdr workspace list`.text()).result?.workspaces;
+        if (!Array.isArray(inventory) || inventory.some((w: { workspace_id: string }) => w.workspace_id === job.workspace)) throw new Error("Saved workspace still exists or cannot be inspected; refusing duplicate launch");
+      }
+      job.resourceUncertain = true;
+      await this.save(job);
+      const result = JSON.parse(await $`herdr workspace create --cwd ${job.worktree} --label ${job.identity!} --no-focus`.text()).result;
+      if (!result?.workspace?.workspace_id || !result.root_pane?.pane_id) throw new Error("Invalid standalone workspace response");
+      job.workspace = result.workspace.workspace_id;
+      job.pane = result.root_pane.pane_id;
+      job.terminalID = result.root_pane.terminal_id;
+      job.resourceUncertain = false;
+      await this.save(job);
+    } else if (job.placement === "subworkspace") {
       if (!job.parentWorkspace) {
         const inventory = JSON.parse(await $`herdr worktree list --cwd ${job.repo} --json`.text()).result;
         if (!inventory?.source?.source_workspace_id) throw new Error("Cannot identify a parent workspace for the requested repository. Open that repository in herdr first.");
@@ -892,16 +928,18 @@ export class Coordinator {
       await this.save(job);
       const response = reopen
         ? await $`herdr worktree open --workspace ${job.parentWorkspace!} --path ${job.worktree} --no-focus --json`.text()
-        : await $`herdr worktree create --workspace ${job.parentWorkspace!} --branch ${job.branch} --base ${job.baseCommit} --path ${job.worktree} --label ${job.name ?? job.agent} --no-focus --json`.text();
+        : await $`herdr worktree create --workspace ${job.parentWorkspace!} --branch ${job.branch} --base ${job.baseCommit} --path ${job.worktree} --label ${job.identity ?? job.name ?? job.agent} --no-focus --json`.text();
       const result = JSON.parse(response).result;
       if (result?.worktree?.path !== job.worktree || !result.workspace?.workspace_id || !result.root_pane?.pane_id) throw new Error("Invalid herdr worktree response; inspect resources before retrying");
       job.workspace = result.workspace.workspace_id;
       job.pane = result.root_pane.pane_id;
+      job.terminalID = result.root_pane.terminal_id;
       job.worktreeCreated = true;
       job.branchCreated = true;
       job.resourceUncertain = false;
       await this.save(job);
       if (reopen && result.already_open) throw new Error("Workspace is already open without the saved pane. Inspect it rather than launching a duplicate session.");
+      if (reopen && job.identity) await $`herdr workspace rename ${job.workspace!} ${job.identity}`.quiet();
     } else {
       if (!reopen) {
         await fs.mkdir(path.dirname(job.worktree), { recursive: true });
@@ -913,32 +951,64 @@ export class Coordinator {
       const { targetPane, direction } = await this.chooseSplitTarget(caller);
       const response = JSON.parse(await $`herdr pane split ${targetPane} --direction ${direction} --ratio 0.5 --cwd ${job.worktree} --no-focus --env ${`${JOBDIR_ENV}=${this.dir(job.jobId)}`}`.text());
       job.pane = response.result.pane.pane_id;
+      job.terminalID = response.result.pane.terminal_id;
       await this.save(job);
+      await $`herdr pane rename ${job.pane!} ${job.identity ?? job.name ?? `${job.agent}-delegate`}`.quiet();
     }
   }
 
   private async launch(job: Job, prompt: string, sessionID?: string) {
     const $ = this.$;
-    if (await exists(path.join(job.worktree, ".envrc"))) await $`direnv allow ${job.worktree}`.quiet().catch(() => {});
+    if (job.worktreeCreated && !sessionID) {
+      for (const name of [".env", ".envrc"]) {
+        const source = path.join(job.repo, name);
+        const sourceStat = await fs.lstat(source).catch((error) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (!sourceStat) continue;
+        if (!sourceStat.isFile()) throw new Error(`Environment source ${name} must be a regular file, not a symlink`);
+        const destination = path.join(job.worktree, name);
+        const destStat = await fs.lstat(destination).catch((error) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (destStat && !destStat.isFile()) throw new Error(`Environment destination ${name} must be a regular file`);
+        if (name === ".env") {
+          try { await $`git -C ${job.worktree} check-ignore -q -- .env`.quiet(); }
+          catch { throw new Error("Refusing to copy .env into a worktree where Git does not ignore it"); }
+        }
+        if (destStat) {
+          if (!(await fs.readFile(source)).equals(await fs.readFile(destination))) throw new Error(`Existing worktree ${name} differs; refusing to overwrite it`);
+        } else {
+          await fs.copyFile(source, destination, 1);
+          await fs.chmod(destination, 0o600);
+        }
+      }
+    }
+    const hasEnv = await exists(path.join(job.worktree, ".env"));
+    if (hasEnv && !(await exists(path.join(job.worktree, ".envrc")))) throw new Error(".env exists without .envrc; configure direnv (for example: dotenv .env) before launching");
+    if (await exists(path.join(job.worktree, ".envrc"))) {
+      try { await $`direnv allow ${job.worktree}`.quiet(); }
+      catch { throw new Error("direnv allow failed; OpenCode was not started"); }
+    }
     await this.waitForShellReady(job.pane!, path.basename(job.worktree));
     const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
     // Worktree-created workspaces cannot receive --env, so set it for the process.
-    const command = `env ${JOBDIR_ENV}=${quote(this.dir(job.jobId))} opencode --agent ${quote(job.agent)} --auto` +
+    const runner = fileURLToPath(new URL("./launch.js", import.meta.url));
+    const command = `env ${JOBDIR_ENV}=${quote(this.dir(job.jobId))} node ${quote(runner)} ${quote(job.worktree)} --agent ${quote(job.agent)} --auto` +
       (sessionID ? ` --session ${quote(sessionID)}` : "") + ` --prompt ${quote(prompt)}`;
     job.launchAttempted = true;
     await this.save(job);
     await lifecycle(job.jobId, "launch_started");
     await $`herdr pane run ${job.pane!} ${command}`.quiet();
-    await $`herdr pane rename ${job.pane!} ${job.name ?? `${job.agent}-delegate`}`.quiet();
   }
 
-  // Wait until the pane's interactive shell has rendered its prompt (the cwd
-  // basename appears in the prompt line). Proves the shell + direnv hook finished
-  // so a following `pane run` won't race a still-initializing shell. Best-effort:
-  // falls back to a short fixed delay if the marker never shows.
+  // Best-effort terminal readiness only. The launcher independently waits for direnv;
+  // prompt text or a delay cannot establish that the environment loaded successfully.
   private async waitForShellReady(pane: string, cwdMarker: string): Promise<void> {
     try {
-      await this.$`herdr wait output ${pane} --match ${cwdMarker} --timeout 10000`.quiet();
+      await this.$`herdr pane wait-output ${pane} --match ${cwdMarker} --timeout 10000`.quiet();
     } catch {
       // Marker never matched (unusual prompt); settle briefly rather than blast.
       await new Promise((r) => setTimeout(r, 1500));
@@ -961,7 +1031,7 @@ export function delegateTool(coord: Coordinator) {
   return tool({
     description:
       "Delegate a bounded task to a real peer opencode agent running in its own git worktree, " +
-      "spawned as a split pane. Returns immediately; completion is reported asynchronously.",
+      "in a split pane or child workspace. Returns immediately; completion is reported asynchronously.",
     args: {
       agent: z.string().describe("opencode agent name to run as the delegate (e.g. worker)."),
       task: z.string().describe("Complete task instructions (this is the ephemeral brief)."),
@@ -1018,7 +1088,7 @@ export function delegateTool(coord: Coordinator) {
         startupTimeoutSeconds: args.startupTimeoutSeconds,
       });
       return (
-        `Delegated to ${args.agent} (job ${jobId.slice(0, 8)}) in pane ${pane}\n` +
+        `Delegated to ${args.agent} (job ${jobId.slice(0, 8)}) in pane ${pane}\nAgent identity: ${coord.agentIdentity(jobId)}\n` +
         `worktree: ${worktree}\n` +
         `Watching for completion — result will be surfaced asynchronously.`
       );
@@ -1074,16 +1144,16 @@ export function replyTool(coord: Coordinator) {
 
 export function openSessionTool(coord: Coordinator) {
   return tool({
-    description: "Open a named interactive peer session for the user to steer. No automatic completion. Supports pane or subworkspace placement.",
+    description: "Open a named interactive peer. pane/subworkspace create isolated Git worktrees; workspace opens an existing working folder directly in an independent workspace. Ask for the folder if missing. No automatic completion.",
     args: {
-      agent: z.string(), name: z.string().min(1), task: z.string().min(1), repo: z.string(), branch: z.string(),
+      agent: z.string(), name: z.string().min(1), task: z.string().min(1), repo: z.string().describe("Absolute repository or existing working folder for workspace placement."), branch: z.string().optional(),
       baseCommit: z.string().optional(), targetBranch: z.string().optional(),
-      placement: z.enum(["pane", "subworkspace"]).default("pane"),
+      placement: z.enum(["pane", "subworkspace", "workspace"]).default("pane"),
     },
     async execute(args, context) {
       const { jobId } = await coord.createJob({ ...args, mode: "interactive", sessionID: context.sessionID, outputContract: "code-change" });
       const { pane, worktree } = await coord.spawnDelegate(jobId, { ...args, outputContract: "code-change" });
-      return `Opened interactive session ${args.name} (${jobId}) in ${args.placement ?? "pane"}, pane ${pane}.\nWorktree: ${worktree}\nThe user steers this session and explicitly pauses, hands back for commit, or requests discard.`;
+      return `Opened interactive session ${args.name} (${jobId}) in ${args.placement ?? "pane"}, pane ${pane}.\nAgent identity: ${coord.agentIdentity(jobId)}\nWorktree: ${worktree}\nThe user steers this session and explicitly pauses, hands back for commit, or requests discard.`;
     },
   });
 }

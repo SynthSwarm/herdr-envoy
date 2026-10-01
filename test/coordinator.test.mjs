@@ -69,7 +69,7 @@ async function fixture(t) {
         return { stdout: "" };
       }
       if (words[0] === "herdr") {
-        if (words[1] === "wait" && options.waitFailure) throw new Error("shell readiness timeout");
+        if (words[2] === "wait-output" && options.waitFailure) throw new Error("shell readiness timeout");
         if (words[2] === "layout") {
           if (options.layoutError) throw new Error("layout unavailable");
           return { stdout: options.layout };
@@ -697,7 +697,6 @@ test("spawn authorises .envrc and uses a mocked readiness fallback before launch
   const input = { ...f.input, baseCommit: undefined, agent: "work'er", task: "DO NOT PUT THIS TASK IN THE SHELL\n$(exit 1)" };
   f.options.agents = "work'er (primary)\n";
   f.options.waitFailure = true;
-  f.options.direnvFailure = true;
   const delays = [];
   t.mock.method(globalThis, "setTimeout", (callback, ms) => {
     delays.push(ms);
@@ -709,11 +708,11 @@ test("spawn authorises .envrc and uses a mocked readiness fallback before launch
   assert.deepEqual(delays, [1500]);
   assert.equal(await fs.readFile(path.join(spawned.worktree, ".envrc"), "utf8"), "export EXAMPLE=1\n");
   const allowIndex = f.calls.findIndex((args) => args[0] === "direnv");
-  const waitIndex = f.calls.findIndex((args) => args[1] === "wait");
+  const waitIndex = f.calls.findIndex((args) => args[2] === "wait-output");
   const runIndex = f.calls.findIndex((args) => args[2] === "run");
   assert.ok(allowIndex < waitIndex && waitIndex < runIndex);
   assert.deepEqual(f.calls[allowIndex], ["direnv", "allow", spawned.worktree]);
-  assert.deepEqual(f.calls[waitIndex], ["herdr", "wait", "output", spawned.pane, "--match", job.jobId, "--timeout", "10000"]);
+  assert.deepEqual(f.calls[waitIndex], ["herdr", "pane", "wait-output", spawned.pane, "--match", job.jobId, "--timeout", "10000"]);
   const command = f.calls[runIndex][4];
   assert.ok(command.includes("--agent 'work'\\''er' --auto --prompt '"));
   assert.match(command, /read_task.*complete.*ask/);
@@ -721,6 +720,23 @@ test("spawn authorises .envrc and uses a mocked readiness fallback before launch
   const metadata = await f.metadata(job);
   assert.equal(metadata.phase, "running");
   assert.equal(metadata.baseCommit, (await f.git("rev-parse", "HEAD")).stdout.trim());
+});
+
+test("direnv approval failure prevents agent command submission", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.repo, ".envrc"), "export TEST=fixture\n");
+  f.options.direnvFailure = true;
+  const job = await f.c.createJob(f.input);
+  await assert.rejects(f.c.spawnDelegate(job.jobId, f.input), /direnv allow failed/);
+  assert.ok(!f.calls.some((args) => args[2] === "run"));
+});
+
+test("unignored environment secrets are refused before launch", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.repo, ".env"), "TEST=fixture\n");
+  const job = await f.c.createJob(f.input);
+  await assert.rejects(f.c.spawnDelegate(job.jobId, f.input), /does not ignore/);
+  assert.ok(!f.calls.some((args) => args[2] === "run"));
 });
 
 test("failed launch with failed cleanup retains all resources for a later reap", async (t) => {

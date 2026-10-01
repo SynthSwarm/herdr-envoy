@@ -16,6 +16,12 @@ The user wants the following peer work:
 
 $ARGUMENTS
 
+Prefer \`list_agents\` for stable identity references and local Git context. New Envoy agents
+use the same reference as their pane or child-workspace label. Use \`request_agent({identity, task})\`
+instead of exposing pane IDs. Refresh discovery before targeting. Remote or ambiguous matches
+are refused; discovery never grants cleanup authority. Owned references also work as jobId
+selectors for reap/reply/resume. Existing jobs retain their old labels and IDs.
+
 Use \`list_machines\` for read-only discovery of Local and saved SSH machines and their live
 OpenCode agents. Idle/done agents are included, not just working ones. Disabled machines are
 not contacted; unavailable inventories are unknown, not empty. Pane IDs are machine-scoped.
@@ -31,6 +37,18 @@ but unconfirmed delivery is not automatically replayed. \`cancel_request\` retir
 without interrupting already-submitted work. Never reap/resume an existing-agent request.
 
 Choose lifecycle separately from placement:
+
+For an existing named agent, discover first and queue to a unique match, even when busy. If absent,
+ask for its working folder, then \`open_session\` with \`placement: "workspace"\` and \`repo\` set
+to that existing absolute folder (omit branch/base/target). This is an independent workspace, not
+a child workspace or new Git worktree. Never delete the supplied project folder during reap.
+"Beside me/same workspace" suggests pane; "child workspace" suggests subworkspace;
+"own working folder/open this project" suggests workspace. These are intent cues, not strict
+keywords. Respect negation and ask briefly if ambiguous. Busy/unreachable does not mean absent.
+Before every new process, Envoy loads direnv in the destination and only spawns OpenCode after
+successful export. New worktrees receive private copies of root .env/.envrc and direnv allow;
+standalone folders use their own files. Never print secrets, bypass failed loading, or infer
+environment readiness merely from a shell prompt. A running session's environment is unchanged.
 
 - Use \`delegate\` for a bounded task with a terminal report. Use \`open_session\` for durable,
   interactive work that the user can pause and resume in the same conversation.

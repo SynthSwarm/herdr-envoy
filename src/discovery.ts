@@ -14,6 +14,7 @@ const agentsSchema = z.object({ result: z.object({ agents: z.array(z.object({
   agent: z.string().nullable().optional(),
   name: z.string().nullable().optional(),
   pane_id: z.string().min(1),
+  terminal_id: z.string().optional(),
   workspace_id: z.string(),
   agent_status: z.enum(["idle", "working", "blocked", "done", "unknown"]),
   cwd: z.string().nullable().optional(),
@@ -41,6 +42,7 @@ export function listMachinesTool(run = promisify(execFile)) {
             status: "available" as const,
             agents: result.result.agents.filter((agent) => agent.agent === "opencode").map((agent) => ({
               paneId: agent.pane_id,
+              ...(agent.terminal_id ? { terminalId: agent.terminal_id } : {}),
               workspaceId: agent.workspace_id,
               name: agent.name ?? null,
               state: agent.agent_status,

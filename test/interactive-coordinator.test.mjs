@@ -92,6 +92,7 @@ async function fixture(t) {
         assert.equal(cwd, repo);
         return { stdout: "worker (primary)\n" };
       }
+      if (program === "direnv") return { stdout: "" };
       assert.equal(program, "herdr", `Unexpected command: ${words.join(" ")}`);
       if (resource === "pane" && action === "get") {
         assert.ok(panes.has(id), `Missing pane ${id}`);
@@ -112,6 +113,15 @@ async function fixture(t) {
       if (resource === "workspace" && action === "get") {
         if (!workspaces.has(id)) throw new Error(`Missing parent workspace ${id}`);
         return json({ workspace: workspaces.get(id) });
+      }
+      if (resource === "workspace" && action === "create") {
+        const workspace = { workspace_id: `standalone-${++nextWorkspace}`, path: flag("--cwd") };
+        workspaces.set(workspace.workspace_id, workspace);
+        return json({ workspace, root_pane: addPane(workspace.workspace_id) });
+      }
+      if (resource === "workspace" && action === "rename") {
+        assert.ok(workspaces.has(id));
+        return json({});
       }
       if (resource === "workspace" && action === "list") return json(options.workspaceList ?? { workspaces: [...workspaces.values()] });
       if (resource === "workspace" && action === "close") {
@@ -161,7 +171,7 @@ async function fixture(t) {
         if (options.failPrompt) throw new Error("agent prompt failed");
         return json({});
       }
-      if (resource === "wait" && action === "output") {
+      if (resource === "pane" && action === "wait-output") {
         assert.ok(panes.has(id));
         return json({});
       }
@@ -278,13 +288,48 @@ test("open_session defaults to pane placement and persists an interactive handof
   const split = f.calls.find((args) => args[2] === "split");
   assert.deepEqual(split, ["herdr", "pane", "split", "coordinator-pane", "--direction", "right", "--ratio", "0.5", "--cwd", job.worktree, "--no-focus", "--env", `${JOBDIR_ENV}=${job.jobDir}`]);
   const launch = f.calls.find((args) => args[2] === "run");
-  assert.ok(launch[4].startsWith(`env ${JOBDIR_ENV}='${job.jobDir}' opencode --agent 'worker' --auto`));
+  assert.ok(launch[4].startsWith(`env ${JOBDIR_ENV}='${job.jobDir}' node `));
+  assert.ok(launch[4].includes(`'${job.worktree}' --agent 'worker' --auto`));
   assert.match(launch[4], /read_task.*Work interactively.*hand_back only on explicit user instruction/);
   assert.doesNotMatch(launch[4], /--session|Keep this task|Call `complete`/);
-  assert.deepEqual(f.calls.find((args) => args[2] === "rename"), ["herdr", "pane", "rename", job.pane, job.name]);
+  assert.deepEqual(f.calls.find((args) => args[2] === "rename"), ["herdr", "pane", "rename", job.pane, job.identity]);
+  assert.ok(f.calls.findIndex((args) => args[2] === "rename") < f.calls.findIndex((args) => args[2] === "run"));
+  assert.equal(f.c.resolveJobId(job.identity, owner.sessionID), job.jobId);
+  assert.equal(f.c.resolveJobId(job.identity, "another-owner"), undefined);
   const schema = tool.schema.object(openSessionTool(f.c).args);
   assert.equal(schema.parse(job.args).placement, "pane");
   assert.equal(schema.safeParse({ ...job.args, placement: "window" }).success, false);
+});
+
+test("standalone workspace uses the supplied folder without creating or deleting a branch or checkout", async (t) => {
+  const f = await fixture(t);
+  const job = await f.open({ placement: "workspace", branch: undefined, baseCommit: undefined });
+  assert.equal(job.worktree, f.repo);
+  assert.equal(job.worktreeCreated, undefined);
+  const creation = f.calls.find((args) => args[1] === "workspace" && args[2] === "create");
+  assert.deepEqual(creation, ["herdr", "workspace", "create", "--cwd", f.repo, "--label", job.identity, "--no-focus"]);
+  assert.ok(!f.calls.some((args) => args[1] === "worktree" || args.includes("add")));
+  await fs.writeFile(path.join(f.repo, "uncommitted.txt"), "keep");
+  await f.handBack(job, "commit");
+  await assert.rejects(f.c.reap(job.jobId, { deleteBranch: true }), /user-owned/);
+  await f.c.reap(job.jobId);
+  assert.equal(await fs.readFile(path.join(f.repo, "uncommitted.txt"), "utf8"), "keep");
+  assert.ok(!f.calls.some((args) => args.includes("remove") || args.includes("-D")));
+});
+
+test("new worktrees copy ignored environment files privately without adding them to Git", async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.repo, ".gitignore"), ".env\n.envrc\n");
+  await f.git("add", ".gitignore");
+  await f.git("commit", "-qm", "ignore local environment");
+  await fs.writeFile(path.join(f.repo, ".env"), "TEST=fixture\n");
+  await fs.writeFile(path.join(f.repo, ".envrc"), "dotenv .env\n");
+  const job = await f.open({ baseCommit: undefined });
+  for (const name of [".env", ".envrc"]) {
+    assert.equal(await fs.readFile(path.join(job.worktree, name), "utf8"), await fs.readFile(path.join(f.repo, name), "utf8"));
+    assert.equal((await fs.stat(path.join(job.worktree, name))).mode & 0o777, 0o600);
+  }
+  assert.ok(f.calls.findIndex((args) => args[0] === "direnv") < f.calls.findIndex((args) => args[2] === "run"));
 });
 
 test("durable recovery survives a changed pane and runtime loss but lists only the same directory and orchestrator", async (t) => {
@@ -301,7 +346,7 @@ test("durable recovery survives a changed pane and runtime loss but lists only t
   await recovered.recover();
   await f.settle(job, recovered);
   const listed = JSON.parse(await listSessionsTool(recovered).execute({}, owner));
-  assert.deepEqual(listed, [{ jobId: job.jobId, name: job.name, status: "paused", phase: "running", placement: "pane", worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: paused.sessionID, summary: paused.summary,
+  assert.deepEqual(listed, [{ jobId: job.jobId, identity: job.identity, name: job.name, status: "paused", phase: "running", placement: "pane", worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: paused.sessionID, summary: paused.summary,
     generation: paused.generation, checks: paused.checks, risks: paused.risks, notificationPending: false }]);
   assert.equal(recovered.resolveJobId(other.jobId, owner.sessionID), undefined);
   assert.equal(recovered.resolveJobId(bounded.jobId), undefined);
@@ -640,7 +685,7 @@ test("subworkspace create and reopen retain the original parent and own only the
   const job = await f.open({ placement: "subworkspace", name: "child session" });
   assert.equal(job.parentWorkspace, "parent");
   assert.equal(f.workspaces.get(job.workspace).parent_workspace_id, "parent");
-  assert.deepEqual(f.calls.find((args) => args[2] === "create"), ["herdr", "worktree", "create", "--workspace", "parent", "--branch", job.branch, "--base", f.base, "--path", job.worktree, "--label", job.name, "--no-focus", "--json"]);
+  assert.deepEqual(f.calls.find((args) => args[2] === "create"), ["herdr", "worktree", "create", "--workspace", "parent", "--branch", job.branch, "--base", f.base, "--path", job.worktree, "--label", job.identity, "--no-focus", "--json"]);
   assert.equal(f.calls.some((args) => args[2] === "split"), false);
   assert.equal((await f.git("-C", job.worktree, "branch", "--show-current")).stdout.trim(), job.branch);
   const paused = await f.handBack(job);
@@ -744,7 +789,7 @@ test("bounded delegation also supports subworkspace placement with runtime state
   assert.equal(metadata.mode, undefined);
   assert.equal(metadata.parentWorkspace, "parent");
   assert.equal(metadata.placement, "subworkspace");
-  assert.equal(create[create.indexOf("--label") + 1], "worker");
+  assert.equal(create[create.indexOf("--label") + 1], f.c.agentIdentity(job.jobId));
   await assert.rejects(fs.access(path.join(sessionRoot(), jobId)), { code: "ENOENT" });
   await assert.rejects(fs.access(path.join(job.jobDir, FILES.session)), { code: "ENOENT" });
   assert.deepEqual(JSON.parse(await f.c.listSessions(owner.sessionID)), []);
@@ -949,7 +994,7 @@ for (const disposition of ["pause", "commit"]) {
     assert.deepEqual(metadata.delivered, []);
     assert.equal(f.posts.length, 0);
     assert.deepEqual(JSON.parse(await listSessionsTool(f.c).execute({}, owner)), [{
-      jobId: job.jobId, name: job.name, status: previous.status, phase: "running", placement: "pane",
+      jobId: job.jobId, identity: job.identity, name: job.name, status: previous.status, phase: "running", placement: "pane",
       worktree: job.worktree, branch: job.branch, pane: job.pane, sessionID: previous.sessionID,
       summary: previous.summary, generation: previous.generation, checks: previous.checks, risks: previous.risks,
       notificationPending: true,
@@ -1419,41 +1464,21 @@ for (const residual of ["none", "wrong-parent branch", "launch", "path", "branch
   });
 }
 
-test("pane rename failure after interactive launch preserves the active session and prevents reap", async (t) => {
+test("pane identity label failure prevents launch and safely cleans up newly created resources", async (t) => {
   const f = await fixture(t);
   f.options.failRename = true;
-  await assert.rejects(f.open(), /Launch may have started session.*resources are preserved for inspection.*pane rename failed/);
+  await assert.rejects(f.open(), /pane rename failed/);
   const runIndex = f.calls.findIndex((args) => args[2] === "run");
   const renameIndex = f.calls.findIndex((args) => args[2] === "rename");
-  assert.ok(runIndex >= 0 && renameIndex > runIndex);
-  const pane = f.calls[runIndex][3];
+  assert.equal(runIndex, -1);
+  assert.ok(renameIndex >= 0);
+  const pane = f.calls[renameIndex][3];
   const split = f.calls.find((args) => args[2] === "split");
   const worktree = split[split.indexOf("--cwd") + 1];
   const jobId = path.basename(worktree);
-  const job = { jobId, jobDir: path.join(sessionRoot(), jobId) };
-  await f.settle(job);
-  const metadata = await f.metadata(job);
-  assert.equal(metadata.launchAttempted, true);
-  assert.equal(metadata.phase, "starting");
-  assert.equal(metadata.pane, pane);
-  assert.equal(metadata.worktreeCreated, true);
-  assert.equal(metadata.branchCreated, true);
-  const state = await f.state(job);
-  assert.equal(state.status, "active");
-  assert.equal(f.panes.has(pane), true);
-  assert.ok(!f.calls.some((args) => args[2] === "close" || args.includes("remove") || args.includes("-D")));
-  await f.c.dispose();
-  const recovered = f.coordinator();
-  await recovered.recover();
-  await f.settle(job, recovered);
-  const start = f.calls.length;
-  await assert.rejects(recovered.reap(jobId, { deleteBranch: true }), /Active or paused sessions must be handed back/);
-  assert.deepEqual(f.calls.slice(start), []);
-  assert.deepEqual(await f.metadata(job), metadata);
-  assert.deepEqual(await f.state(job), state);
-  assert.equal(f.panes.has(pane), true);
-  await fs.access(worktree);
-  await f.git("show-ref", "--verify", `refs/heads/${metadata.branch}`);
+  assert.equal(f.panes.has(pane), false);
+  assert.equal(f.c.resolveJobId(jobId), undefined);
+  await assert.rejects(fs.access(worktree), { code: "ENOENT" });
 });
 
 test("uncertain workspace inventory and failed close retain ownership for safe retry", async (t) => {

@@ -13,7 +13,7 @@ export const JOBDIR_ENV = "PEER_DELEGATE_JOBDIR";
 
 export type OutputContract = "advisory" | "code-change";
 export type MergePolicy = "manual" | "auto-after-checks";
-export type Placement = "pane" | "subworkspace";
+export type Placement = "pane" | "subworkspace" | "workspace";
 export type SessionDisposition = "active" | "paused" | "commit" | "discard";
 
 export interface InteractiveSession {

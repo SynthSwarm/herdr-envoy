@@ -107,7 +107,7 @@ test("coordinator initialises recovery, provisions guidance and exposes only coo
   const hooks = await f.load();
   assert.equal(recover.mock.callCount(), 1);
   assert.deepEqual(Object.keys(hooks).sort(), ["config", "dispose", "tool"]);
-  assert.deepEqual(Object.keys(hooks.tool).sort(), ["cancel_request", "delegate", "hand_back", "list_machines", "list_sessions", "open_session", "read_task", "reap_delegate", "reply_delegate", "request_agent", "resume_session"]);
+  assert.deepEqual(Object.keys(hooks.tool).sort(), ["cancel_request", "delegate", "hand_back", "list_agents", "list_machines", "list_sessions", "open_session", "read_task", "reap_delegate", "reply_delegate", "request_agent", "resume_session"]);
   assert.match(await fs.readFile(f.skill, "utf8"), /name: envoy/);
   assert.equal(await hooks.tool.request_agent.execute({ paneId: "peer", sessionId: "target", task: "Review" }, { sessionID: "owner" }), "queued");
   assert.deepEqual(request.mock.calls[0].arguments, ["peer", "Review", "owner", "target"]);
