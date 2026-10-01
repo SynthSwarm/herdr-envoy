@@ -523,6 +523,8 @@ test("commit hand-back does not commit automatically and reap preserves dirty wo
   const start = f.calls.length;
   await f.handBack(job, "commit");
   assert.match(f.posts[0].parts[0].text, /READY FOR COMMIT.*commit in the worktree BEFORE reap_delegate.*No merge or push/);
+  assert.match(f.posts[0].parts[0].text, /Do not repeat the peer's investigation, full review or successful checks by default/);
+  assert.match(f.posts[0].parts[0].text, /Checks: manual check passed/);
   assert.deepEqual(f.calls.slice(start), []);
   assert.equal((await f.git("rev-parse", job.branch)).stdout.trim(), f.base);
   await assert.rejects(f.c.reap(job.jobId, { discard: true, confirmation: job.jobId }), /has not requested discard/);

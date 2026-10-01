@@ -4,6 +4,8 @@
 // ships coordinator guidance without installing any files (agents stay the
 // user's own).
 
+import { HANDOVER_REVIEW } from "./review.js";
+
 export const DELEGATE_COMMAND_NAME = "envoy";
 
 export const delegateCommand = {
@@ -63,7 +65,7 @@ environment readiness merely from a shell prompt. A running session's environmen
 - The \`delegate\` tool returns after launch setup, without waiting for completion. Reports arrive
   asynchronously in the tool context's owning \`sessionID\`. Do not block waiting on them.
 - The plugin validates report identity and basic Git invariants, not code correctness. It does
-  not automatically merge or reap completed jobs. Review code changes, run required checks and
+  not automatically merge or reap completed jobs. Use peer evidence and a focused handover review, and
   obtain USER approval before merging. Never automatically merge or push.
 
 Before calling either creation tool, resolve these arguments:
@@ -121,6 +123,8 @@ disposition and HTTP status are recorded, never text, paths or tokens. Keep toda
 failure logs are limited to once per minute per job per process. Logging failures do not block
 operations, and historical events are not backfilled.
 
+Handover review: ${HANDOVER_REVIEW}
+
 Call the chosen creation tool and tell the user it's running. For bounded completion, review it
 and report the outcome. Handling the follow-up depends on the note:
 - **blocked** (the delegate asked a question): answer it with the \`reply_delegate\` tool — this
@@ -128,7 +132,7 @@ and report the outcome. Handling the follow-up depends on the note:
 - **rejected report / failure / stalled / startup timeout**: inspect the job before deciding on
   cleanup or a new delegation. A startup timeout only notifies; it does not kill the delegate.
 - **completed**: review the deliverable and report the outcome. Code changes still require
-  checks and user approval for merge. Completion is terminal; follow-up work needs a new job.
+  check evidence and user approval for merge, not automatic reruns. Completion is terminal; follow-up work needs a new job.
 
 Interactive peers expose \`read_task\` and \`hand_back\`, never \`complete\` or \`ask\`.
 When the active task is finished with nothing to commit, automatically call \`hand_back\` with
@@ -140,7 +144,7 @@ Pause, commit and discard require explicit user direction:
 - \`completed\` is terminal. Review and report the deliverable. No automatic commit or cleanup.
   Follow-up work needs a new job. A completed owned checkout is eligible for ordinary cleanup.
 - "done for now" means \`pause\`: preserve conversation, pane/workspace, worktree, branch and metadata.
-- "hand this back" with changes to commit means \`commit\`: the ORCHESTRATOR reviews changes, runs checks and commits in
+- "hand this back" with changes to commit means \`commit\`: the ORCHESTRATOR reviews scope, diff and peer evidence, then commits in
   that checkout BEFORE reaping. The peer does not commit merely because it hands back.
 - "discard this" means \`discard\`: record a request, then obtain explicit destructive user
   confirmation in the orchestrator. The request alone does not authorise removal.

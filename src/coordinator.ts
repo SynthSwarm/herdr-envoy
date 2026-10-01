@@ -32,6 +32,7 @@ import {
 import { verify } from "./verify.js";
 import { lifecycle } from "./log.js";
 import { agentRef } from "./identity.js";
+import { HANDOVER_REVIEW } from "./review.js";
 
 interface Job {
   identity?: string;
@@ -259,6 +260,7 @@ export class Coordinator {
     lines.push(`[peer-delegate] Delegate job ${short} reported: ${r.status} (${r.outputContract}).`);
     lines.push(`Summary: ${r.summary}`);
     if (r.evidence?.length) lines.push(`Evidence:\n- ${r.evidence.join("\n- ")}`);
+    if (r.checksPerformed?.length) lines.push(`Peer checks:\n- ${r.checksPerformed.map((check) => `${check.command} (exit ${check.exitCode}): ${check.summary}`).join("\n- ")}`);
     if (r.risks?.length) lines.push(`Risks:\n- ${r.risks.join("\n- ")}`);
     if (r.followUps?.length) lines.push(`Follow-ups:\n- ${r.followUps.join("\n- ")}`);
     if (r.outputContract === "code-change") {
@@ -272,7 +274,7 @@ export class Coordinator {
       lines.push(`Delegate pane ${job.pane ?? "?"} is still OPEN; worktree: ${job.worktree}.`);
     }
     lines.push(
-        `No merge or cleanup has been performed. Review the deliverable and run the required checks. ` +
+        `No merge or cleanup has been performed. ${HANDOVER_REVIEW} ` +
          `Obtain user approval before merging code changes, then use \`reap_delegate\` (jobId ${short}) ` +
          `when the checkout is clean and no longer needed. Completion is terminal; use a new job for follow-up work. ` +
         `Report the outcome to the user.`,
@@ -643,11 +645,11 @@ export class Coordinator {
             : session.status === "paused"
             ? "PAUSED. Preserve the conversation, checkout and branch. Do not commit, merge or reap. Use resume_session to continue."
             : session.status === "commit"
-              ? "READY FOR COMMIT. Review the diff and run checks, then commit in the worktree BEFORE reap_delegate. No merge or push is authorised."
+              ? "READY FOR COMMIT. Use the handover evidence and a focused scope/status/diff review, then commit in the worktree BEFORE reap_delegate. No merge or push is authorised."
               : session.status === "completed"
                 ? "COMPLETED. Review the deliverable and report the outcome. Nothing needs committing for this task. No automatic cleanup is requested. Use a new job for follow-up work."
                 : `DISCARD REQUESTED. Ask the user to confirm deletion of this checkout and any unwanted commits. Only then reap_delegate with discard=true, confirmation=${jobId}, and deleteBranch if approved.`;
-          await this.promptSelf(jobId, key, `[peer-session] ${job.name} (${jobId}): ${instruction}\nSummary: ${session.summary}\nChecks: ${(session.checks ?? []).join("; ")}\nRisks: ${(session.risks ?? []).join("; ")}\nWorktree: ${job.worktree}\nBranch: ${job.branch}` + (session.userInstruction ? `\nUser instruction: ${session.userInstruction}` : ""));
+          await this.promptSelf(jobId, key, `[peer-session] ${job.name} (${jobId}): ${instruction}\n${HANDOVER_REVIEW}\nSummary: ${session.summary}\nChecks: ${(session.checks ?? []).join("; ")}\nRisks: ${(session.risks ?? []).join("; ")}\nWorktree: ${job.worktree}\nBranch: ${job.branch}` + (session.userInstruction ? `\nUser instruction: ${session.userInstruction}` : ""));
         } else if (!session.sessionID && Date.now() - job.createdAt > job.startupTimeoutSeconds * 1000 && !job.delivered.includes("startup-timeout")) {
           await this.notifyStartupTimeout(jobId);
         }

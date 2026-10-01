@@ -283,7 +283,7 @@ instruction to keep the session open takes precedence. Pause, commit and discard
 | --- | --- | --- |
 | Finished work with nothing to commit, automatically or on "hand this back" | `completed` | Review and report the deliverable. Terminal status, with no automatic commit or cleanup. |
 | "done for now" | `pause` | Preserve conversation, pane/workspace, checkout, branch and metadata for resume. |
-| "hand this back" with changes to commit | `commit` | Review changes, run checks and commit in the session checkout **before** reaping. Do not automatically merge or push. |
+| "hand this back" with changes to commit | `commit` | Review scope, diff and peer check evidence, then commit in the session checkout **before** reaping. Do not automatically merge or push. |
 | "discard this" | `discard` | Record a discard request. Ask for explicit destructive confirmation in the orchestrator before force removal. |
 
 Handback records a summary, checks and risks. The interactive peer does not commit or clean up
@@ -336,7 +336,12 @@ can explicitly resume commit-ready work. Completed and discarded work cannot res
   code-change reports also get basic Git checks: clean tree, at least one commit past the assigned
   base, head reachable from the assigned branch, base ancestry and a limited protocol-artifact
   filename check. This does not prove correctness or passing project checks. Advisory content is
-  trusted. Review code changes, run required checks and obtain user approval before merging.
+  trusted. Review scope, diff and peer check evidence and obtain user approval before merging.
+  Do not repeat the peer's investigation, full review or successful checks by default. Rerun only
+  affected/missing checks for later edits, missing/failed/inconsistent evidence, a specific risk,
+  or user/repository requirements, and explain why. Attribute reused results to the peer. Peers
+  should identify commands/outcomes, revisions or files checked and subsequent edits. This is
+  guidance for handover review, not a verified test cache; Git/identity/cleanup safety checks remain.
 - **Placement.** `pane` uses plain Git at `<repo>/.herdr-envoy/worktrees/<job-id>/` and a split
   pane in the current workspace. `subworkspace` uses `herdr worktree create/open --workspace`
   with the requested repository's parent, found through `herdr worktree list --cwd <repo>` and

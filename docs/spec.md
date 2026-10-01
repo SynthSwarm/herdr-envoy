@@ -162,7 +162,7 @@ The tool records the report, it does not independently verify task completion or
 | --- | --- | --- |
 | Finished work with nothing to commit, automatically or on "hand this back" | `completed` | Notify the coordinator with the deliverable. Terminal status with no automatic commit or cleanup. |
 | "done for now" | `pause` | Pause and preserve conversation, pane/workspace, worktree, branch and durable metadata. No commit or reap. |
-| "hand this back" with changes to commit | `commit` | Return control to the orchestrator. The orchestrator reviews the diff, runs required checks and commits in the session worktree before reaping. No automatic merge or push. |
+| "hand this back" with changes to commit | `commit` | Return control to the orchestrator. Review scope, diff and peer check evidence, then commit in the session worktree before reaping. No automatic merge or push. |
 | "discard this" | `discard` | Mark the session discard-requested. The orchestrator must obtain separate explicit destructive confirmation before force removal. |
 
 Handback is not a peer-side commit, merge or cleanup command. A failed review, check or commit
@@ -289,9 +289,16 @@ also require:
 Advisory content and failure reports receive no Git checks. Identity and basic Git validation
 do not establish code correctness, prove reported head equals branch tip, or prove project checks
 passed. Check fields in the protocol are metadata, not an automated checks gate; the exposed
-delegate tool does not accept a checks list, and `complete` writes an empty `checksPerformed`.
+delegate tool does not accept a checks list. `complete` accepts optional `checksPerformed`
+with commands, exit codes and outcome summaries; omitted evidence defaults to an empty list.
+The coordinator includes these reported checks in its completion notification without executing them.
 The coordinator does not invoke the retained synthetic-merge helper. Review the deliverable,
-run required checks and obtain explicit user approval before any code merge.
+use peer check evidence and obtain explicit user approval before any code merge. Do not repeat
+investigations, full reviews or successful checks by default. Rerun affected/missing checks for
+post-verification edits, missing/failed/inconsistent evidence, specific risks or user/repository
+requirements, stating the reason. Reused results must be attributed to the peer. Reports should
+identify checks/outcomes, revision/files and subsequent edits. This does not remove protocol,
+identity, Git or cleanup safety checks, and does not automatically certify reported evidence.
 
 ## Explicit Cleanup
 

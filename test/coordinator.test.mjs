@@ -767,13 +767,16 @@ test("verified code-change success reports evidence and leaves merging and clean
   const spawned = await f.c.spawnDelegate(job.jobId, input);
   await f.git("-C", spawned.worktree, "commit", "-q", "--allow-empty", "-m", "delegate change");
   const head = (await f.git("rev-parse", input.branch)).stdout.trim();
-  await f.publish(job, { branch: input.branch, baseCommit: f.base, headCommit: head, evidence: ["tests pass", "reviewed diff"], risks: ["manual rollout"], followUps: ["review then merge"] });
+  await f.publish(job, { branch: input.branch, baseCommit: f.base, headCommit: head, evidence: ["tests pass", "reviewed diff"], risks: ["manual rollout"], followUps: ["review then merge"], checksPerformed: [{ command: "node --test", exitCode: 0, summary: `Passed at ${head}; no later edits` }] });
   f.options.toastFailure = true;
   await f.c.reconcile(job.jobId);
   await f.c.reconcile(job.jobId);
   assert.equal(f.posts.length, 1);
   const text = f.posts[0].parts[0].text;
   assert.match(text, /reported: success \(code-change\)/);
+  assert.match(text, /Peer checks:\n- node --test \(exit 0\): Passed at/);
+  assert.match(text, /Do not repeat the peer's investigation, full review or successful checks by default/);
+  assert.match(text, /State the reason for any repeated check/);
   assert.match(text, /Evidence:\n- tests pass\n- reviewed diff/);
   assert.match(text, /Risks:\n- manual rollout/);
   assert.match(text, /Follow-ups:\n- review then merge/);

@@ -6,6 +6,7 @@
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { HANDOVER_REVIEW } from "./review.js";
 
 export const SKILL_NAME = "envoy";
 
@@ -152,7 +153,9 @@ owning session is busy. This is not an exactly-once delivery guarantee. Interpre
 - **stalled / startup timeout** — inspect the pane. A stale heartbeat is only a possible stall;
   startup timeout (default 30 seconds) notifies only and does not kill the delegate.
 
-For code changes, review the diff, run the required checks and obtain USER approval before
+${HANDOVER_REVIEW}
+
+For code changes, use a focused handover review and obtain USER approval before
 merging. Never automatically merge or push. Advisory content is trusted, not independently
 verified. Bounded completion is terminal with no reopen operation; use a new job for follow-up.
 
@@ -167,8 +170,8 @@ Pause, commit and discard require explicit user direction.
   clean up. Follow-up work needs a new job. A completed owned checkout is eligible for ordinary cleanup.
 - "done for now": \`pause\` preserves the conversation, pane/workspace, checkout, branch and
   metadata. Do not commit or reap.
-- "hand this back" with changes to commit: \`commit\` returns control to the orchestrator, who reviews the diff, runs
-  required checks and commits in the session checkout BEFORE reaping. A failed review, check or
+- "hand this back" with changes to commit: \`commit\` returns control to the orchestrator, who reviews scope, diff and
+  peer check evidence, then commits in the session checkout BEFORE reaping. A failed review, check or
   commit preserves the session. The peer does not commit or clean up merely because it hands back.
 - "discard this": \`discard\` records a discard request. Obtain separate explicit destructive
   confirmation from the user in the orchestrator before removing work. The request is not consent.

@@ -206,7 +206,9 @@ export function readTaskTool(state: DelegateState) {
               `An explicit user instruction to complete, commit or discard may be handed back without resuming.\n` :
               `Ask the coordinator to resolve the existing hand-back or use \`open_session\` for further work.\n`)) +
           `Call \`read_task\` again to reread current control, especially after a resume.\n\n` +
-          `## Hand-back\nDo not call \`complete\` or \`ask\`. Ask the user directly when you need guidance. ` +
+          `## Hand-back\nInclude the checks actually performed, their outcomes, the revision or changed files checked, ` +
+          `and whether any edits followed those checks. Record skipped/failed checks and unresolved risks so the coordinator need not redo your work. ` +
+          `Do not call \`complete\` or \`ask\`. Ask the user directly when you need guidance. ` +
           `When the active task is finished and there is nothing to commit for this task, automatically call ` +
           `\`hand_back\` with disposition="completed", the deliverable in summary, checks and risks. ` +
           `Do not ask for confirmation or invent a userInstruction. Verify that no task changes need committing; ` +
@@ -238,7 +240,7 @@ export function handBackTool(state: DelegateState) {
   const args = {
     disposition: z.enum(["pause", "completed", "commit", "discard"]),
     summary: z.string().describe("Summarise the work and its current state."),
-    checks: z.array(z.string()).default([]),
+    checks: z.array(z.string()).default([]).describe("Checks actually performed and outcomes, revision/files checked, and any subsequent edits. Identify skipped or failed checks; do not invent evidence."),
     risks: z.array(z.string()).default([]),
     userInstruction: z.string().min(1).refine((value) => value.trim().length > 0).optional()
       .describe("For pause, commit, discard or completing paused work, quote the user's explicit instruction. Omit for automatic completed hand-back."),
@@ -299,6 +301,8 @@ export function completeTool(state: DelegateState) {
       status: z.enum(["success", "failure"]).describe("Did you complete the task?"),
       summary: z.string().describe("One crisp human-readable sentence."),
       evidence: z.array(z.string()).optional().describe("References/observations the coordinator can spot-check."),
+      checksPerformed: z.array(z.object({ command: z.string(), exitCode: z.number().int(), summary: z.string() })).optional()
+        .describe("Checks actually run, exit codes and outcomes, including revision/files checked and subsequent edits."),
       risks: z.array(z.string()).optional(),
       followUps: z.array(z.string()).optional(),
       branch: z.string().optional().describe("Required for code-change."),
@@ -333,7 +337,7 @@ export function completeTool(state: DelegateState) {
         outputContract: c.outputContract,
         summary: args.summary,
         evidence: args.evidence ?? [],
-        checksPerformed: [],
+        checksPerformed: args.checksPerformed ?? [],
         risks: args.risks ?? [],
         followUps: args.followUps ?? [],
         ...(c.outputContract === "code-change"
